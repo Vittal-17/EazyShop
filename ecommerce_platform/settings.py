@@ -45,12 +45,13 @@ CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://django-react-ecommerce-platform.vercel.app",
+    "https://eazyshop-store.vercel.app",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://django-react-ecommerce-platform.vercel.app",
+    "https://eazyshop-store.vercel.app",
 ]
-
 # 🚀 Cross-Domain Cookie Security Flags (MANDATORY FOR VERCEL + RENDER)
 SESSION_COOKIE_SAMESITE = 'None'
 SESSION_COOKIE_SECURE = True
