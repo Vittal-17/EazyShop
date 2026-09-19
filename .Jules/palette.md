@@ -1,0 +1,3 @@
+## 2026-09-19 - Added Accessibility Attributes to Navbar Buttons
+**Learning:** Icon-only buttons used for navigation and user profiles (like `UserButton` and `MobileToggleButton`) lacked necessary ARIA attributes for screen reader accessibility. Adding `aria-label`, `aria-expanded`, and `aria-haspopup` significantly improves usability for assistive technologies by communicating the button's purpose and state.
+**Action:** Always ensure that icon-only interactive elements in components have appropriate `aria-label` attributes and use state-bound ARIA properties (like `aria-expanded`) when they toggle visibility of other UI sections.
