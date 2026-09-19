@@ -722,9 +722,19 @@ class OrderViewSet(viewsets.ModelViewSet):
 class OrderItemViewSet(viewsets.ModelViewSet):
     queryset = OrderItem.objects.select_related('order', 'product').all()
     serializer_class = OrderItemSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        user = self.request.user
         queryset = super().get_queryset()
+
+        if getattr(user, 'role', '') == 'admin' or user.is_staff:
+            pass
+        elif getattr(user, 'role', '') == 'seller':
+            queryset = queryset.filter(Q(order__user=user) | Q(vendor=user))
+        else:
+            queryset = queryset.filter(order__user=user)
+
         order_id = self.request.query_params.get('order')
         if order_id:
             queryset = queryset.filter(order_id=order_id)

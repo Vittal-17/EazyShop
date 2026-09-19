@@ -1,0 +1,4 @@
+## 2025-02-14 - [Fixed IDOR / BOLA in OrderItemViewSet]
+**Vulnerability:** Found a Broken Object Level Authorization (BOLA) vulnerability in `api/views.py` inside `OrderItemViewSet`. It lacked `permission_classes = [IsAuthenticated]` and any filtering in `get_queryset` related to user permissions, allowing any authenticated user to retrieve all `OrderItem` records by querying `/api/order-items/`.
+**Learning:** In Django REST Framework (DRF), `ModelViewSet` instances will leak data unless both authentication requirements are set (`permission_classes`) and the `get_queryset` method explicitly filters by the current user's role and identity.
+**Prevention:** Always verify `permission_classes` on new ViewSets, and ensure `get_queryset` filters items to the authenticated user unless they have explicitly authorized admin roles.
