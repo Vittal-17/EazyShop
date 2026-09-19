@@ -107,7 +107,13 @@ const Navbar = () => {
                 </DesktopWishlist>
                 
                 <UserDropdownContainer>
-                  <UserButton onClick={toggleDropdown} $isOpen={isDropdownOpen}>
+                  <UserButton
+                    onClick={toggleDropdown}
+                    $isOpen={isDropdownOpen}
+                    aria-label="User menu"
+                    aria-expanded={isDropdownOpen}
+                    aria-haspopup="menu"
+                  >
                     {/* 🚀 CLOUDINARY PROFILE PICTURE INTEGRATION IN NAVBAR */}
                     <NavAvatarWrapper>
                       {user?.profile_picture ? (
@@ -168,7 +174,11 @@ const Navbar = () => {
               </DesktopWishlist>
             )}
 
-            <MobileToggleButton onClick={toggleMobileMenu}>
+            <MobileToggleButton
+              onClick={toggleMobileMenu}
+              aria-label={isMobileMenuOpen ? "Close menu" : "Open menu"}
+              aria-expanded={isMobileMenuOpen}
+            >
               {isMobileMenuOpen ? <FaTimes size={22} /> : <FaBars size={22} />}
             </MobileToggleButton>
           </RightSection>
