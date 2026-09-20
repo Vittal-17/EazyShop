@@ -720,7 +720,8 @@ class OrderViewSet(viewsets.ModelViewSet):
 
 
 class OrderItemViewSet(viewsets.ModelViewSet):
-    queryset = OrderItem.objects.select_related('order', 'product').all()
+    # ⚡ Bolt: Added 'order__user' to select_related to fix N+1 query when serializer accesses 'username' via 'order.user.username'
+    queryset = OrderItem.objects.select_related('order', 'order__user', 'product').all()
     serializer_class = OrderItemSerializer
 
     def get_queryset(self):

@@ -420,7 +420,10 @@ class EazyShopTitaniumTestSuite(APITestCase):
     # ==========================================
     # PHASE 12: VENDOR FULFILLMENT & PARENT-CHILD SYNC
     # ==========================================
-    def test_48_vendor_updates_item_status_syncs_parent_order(self):
+    @patch('razorpay.Client')
+    def test_48_vendor_updates_item_status_syncs_parent_order(self, mock_razorpay):
+        mock_client = mock_razorpay.return_value
+        mock_client.order.create.return_value = {'id': 'order_mock', 'amount': 5000, 'currency': 'INR'}
         approved_prod = Product.objects.create(name="Vendor Fulfillment Item", price=50.00, stock=5, vendor=self.seller, approval_status='approved', is_active=True)
 
             # 🚀 FIX: Use our custom endpoint that properly maps the vendor to the OrderItem
