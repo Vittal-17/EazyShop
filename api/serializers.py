@@ -7,6 +7,7 @@ from rest_framework.exceptions import PermissionDenied
 
 from .email_service import send_welcome_email
 from .models import (
+    GiftCard,
     Address,
     AdminLog,
     Cart,
@@ -29,7 +30,7 @@ from .models import (
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'role', 'phone', 'profile_picture']
+        fields = ['id', 'username', 'email', 'role', 'phone', 'profile_picture', 'wallet_balance']
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
@@ -313,3 +314,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data["refresh"] = str(refresh)
 
         return data
+class GiftCardSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GiftCard
+        fields = '__all__'

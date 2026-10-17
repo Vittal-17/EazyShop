@@ -26,6 +26,6 @@ describe('OrderSuccess Component', () => {
     expect(screen.getByText('#999')).toBeInTheDocument();
     expect(screen.getByText('txn_12345')).toBeInTheDocument();
     expect(screen.getByText('123 Testing Lane')).toBeInTheDocument();
-    expect(screen.getByText('$500.00')).toBeInTheDocument();
+    expect(screen.getByText('₹500.00')).toBeInTheDocument();
   });
 });

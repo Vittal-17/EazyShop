@@ -6,6 +6,7 @@ import { FaBox, FaPlus, FaEdit, FaTrash, FaTimes, FaTag, FaImage, FaExclamationT
 import { toast } from 'react-hot-toast';
 import AuthContext from '../../context/AuthContext';
 import ModalPortal from '../../components/ModalPortal';
+import { formatINR } from '../../utils/currency';
 
 // ==========================================
 // PRODUCT ADD/EDIT MODAL
@@ -67,7 +68,7 @@ const ProductModal = ({ isOpen, onClose, onSubmit, initialData, categories, isSu
 
           <GridRow>
             <FormGroup>
-              <label>Price ($)</label>
+              <label>Price (₹)</label>
               <InputField type="number" step="0.01" name="price" value={formData.price} onChange={handleChange} placeholder="0.00" />
             </FormGroup>
             <FormGroup>
@@ -271,7 +272,7 @@ const VendorProductsSection = () => {
               <div className="details">
                 <h4 className="truncate">{product.name}</h4>
                 <div className="meta">
-                  <span className="price">${Number(product.price).toFixed(2)}</span>
+                  <span className="price">{formatINR(product.price)}</span>
                   <span className="stock">Stock: {product.stock}</span>
                 </div>
                 <p className="category"><FaTag size={12} /> {getCategoryName(product.category)}</p>

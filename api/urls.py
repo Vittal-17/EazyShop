@@ -2,6 +2,11 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    GiftCardPurchaseView,
+    GiftCardVerifyPurchaseView,
+    GiftCardCheckView,
+    GiftCardListView,
+    GiftCardRedeemView,
     AddressViewSet,
     AdminLogViewSet,
     CartItemViewSet,
@@ -19,7 +24,7 @@ from .views import (
     ReviewViewSet,
     UserViewSet,
     VendorSalesViewSet,
-    WishlistViewSet,VerifyOTPView,RequestPasswordResetView,ConfirmPasswordResetView,DownloadInvoiceView
+    WishlistViewSet,VerifyOTPView,RequestPasswordResetView,ConfirmPasswordResetView,DownloadInvoiceView,razorpay_webhook
 )
 
 # Public API router
@@ -46,14 +51,20 @@ admin_router.register(r'products', ProductViewSet, basename='admin-products')
 admin_router.register(r'orders', OrderViewSet, basename='admin-orders')
 
 urlpatterns = [
+    path('gift-cards/', GiftCardListView.as_view(), name='gift-card-list'),
+    path('gift-cards/redeem/', GiftCardRedeemView.as_view(), name='gift-card-redeem'),
+    path('gift-cards/check/', GiftCardCheckView.as_view(), name='gift-card-check'),
+    path('gift-cards/purchase/', GiftCardPurchaseView.as_view(), name='gift-card-purchase'),
+    path('gift-cards/verify/', GiftCardVerifyPurchaseView.as_view(), name='gift-card-verify'),
     path('', include(router.urls)),  # public API
     path('secure/api/', include(admin_router.urls)),  # protected admin-only API for React
     path('register/', RegisterView.as_view(), name='register'),
     path('token/', CookieTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('token/refresh/', CookieTokenRefreshView.as_view(), name='token_refresh'), 
+    path('token/refresh/', CookieTokenRefreshView.as_view(), name='token_refresh'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('password-reset/request/', RequestPasswordResetView.as_view(), name='password-reset-request'),
     path('password-reset/verify/', VerifyOTPView.as_view(), name='password-reset-verify'),
     path('password-reset/confirm/', ConfirmPasswordResetView.as_view(), name='password-reset-confirm'),
     path('orders/<int:order_id>/invoice/', DownloadInvoiceView.as_view(), name='download-invoice'),
+    path('webhooks/razorpay/', razorpay_webhook, name='razorpay-webhook'),
 ]

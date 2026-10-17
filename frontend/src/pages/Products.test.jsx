@@ -48,7 +48,7 @@ describe('Products Component', () => {
     
     // Use findByText to wait for the Promise.all to resolve
     expect(await screen.findByText('Test Laptop')).toBeInTheDocument();
-    expect(await screen.findByText('$1000.00')).toBeInTheDocument();
+    expect(await screen.findByText('₹1000.00')).toBeInTheDocument();
   });
 
   it('filters out products when out of stock toggle is clicked', async () => {

@@ -130,114 +130,113 @@ const Register = () => {
 
       <AppLayout>
         <GlowingPageContainer $maxWidth="1100px">
-        {/* 🚀 AuthWrapper Perfectly Centers the Card */}
-        <AuthWrapper>
-          <RegisterCard
-            initial={{ opacity: 0, y: 30 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ type: "spring", stiffness: 300, damping: 25 }}
-          >
-            <IconWrapper
-              initial={{ scale: 0 }}
-              animate={{ scale: 1 }}
-              transition={{ delay: 0.2, type: "spring", stiffness: 300 }}
+          {/* 🚀 Matches login optical vertical centering precisely */}
+          <AuthWrapper>
+            <RegisterCard
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ type: "spring", stiffness: 300, damping: 25 }}
             >
-              <FaUserPlus size={26} />
-            </IconWrapper>
-            
-            <Title>Create Account</Title>
-            <Subtitle>Join EazyShop and start shopping today</Subtitle>
-
-            <form onSubmit={handleSubmit}>
-              <InputField
-                type="text"
-                name="username"
-                placeholder="Username"
-                value={form.username}
-                onChange={handleChange}
-                required
-                disabled={isLoading}
-                whileFocus={{ scale: 1.02 }}
-              />
-              <InputField
-                type="email"
-                name="email"
-                placeholder="Email Address"
-                value={form.email}
-                onChange={handleChange}
-                required
-                disabled={isLoading}
-                whileFocus={{ scale: 1.02 }}
-              />
-              <InputField
-                type="password"
-                name="password"
-                placeholder="Password"
-                value={form.password}
-                onChange={handleChange}
-                onFocus={handlePasswordFocus}
-                onBlur={handlePasswordBlur}
-                required
-                disabled={isLoading}
-                whileFocus={{ scale: 1.02 }}
-              />
-              
-              {/* 🚀 Beautifully restyled dynamic password rules */}
-              <AnimatePresence>
-                {showPasswordRules && (
-                  <PasswordRules
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: 'auto' }}
-                    exit={{ opacity: 0, height: 0 }}
-                  >
-                    <PasswordRule $valid={passwordValidation.length}>
-                      {passwordValidation.length ? <FaCheckCircle /> : <FaCircle className="dot" />} At least 8 characters
-                    </PasswordRule>
-                    <PasswordRule $valid={passwordValidation.notNumeric}>
-                      {passwordValidation.notNumeric ? <FaCheckCircle /> : <FaCircle className="dot" />} Not entirely numeric
-                    </PasswordRule>
-                    <PasswordRule $valid={passwordValidation.notSimilar}>
-                      {passwordValidation.notSimilar ? <FaCheckCircle /> : <FaCircle className="dot" />} Not similar to email/username
-                    </PasswordRule>
-                  </PasswordRules>
-                )}
-              </AnimatePresence>
-              
-              <InputField
-                type="password"
-                name="password2"
-                placeholder="Confirm Password"
-                value={form.password2}
-                onChange={handleChange}
-                onFocus={handlePasswordFocus}
-                onBlur={handlePasswordBlur}
-                required
-                disabled={isLoading}
-                whileFocus={{ scale: 1.02 }}
-              />
-              
-              <AnimatePresence>
-                {showPasswordRules && (
-                  <PasswordRule $valid={passwordValidation.matches} style={{ marginBottom: '1.5rem', marginTop: '-0.5rem' }}>
-                    {passwordValidation.matches ? <FaCheckCircle /> : <FaCircle className="dot" />} Passwords match
-                  </PasswordRule>
-                )}
-              </AnimatePresence>
-
-              <SubmitButton
-                type="submit"
-                disabled={isLoading}
-                whileHover={{ scale: isLoading ? 1 : 1.02 }}
-                whileTap={{ scale: isLoading ? 1 : 0.98 }}
+              <IconWrapper
+                initial={{ scale: 0 }}
+                animate={{ scale: 1 }}
+                transition={{ delay: 0.2, type: "spring", stiffness: 300 }}
               >
-                {isLoading ? 'Registering...' : 'Create Account'}
-              </SubmitButton>
-            </form>
-            
-            <LoginLink>
-              Already have an account? <Link to="/login" state={{ from }}>Login now</Link>
-            </LoginLink>
-          </RegisterCard>
+                <FaUserPlus size={22} />
+              </IconWrapper>
+              
+              <Title>Create Account</Title>
+              <Subtitle>Join EazyShop and start shopping today</Subtitle>
+
+              <form onSubmit={handleSubmit}>
+                <InputField
+                  type="text"
+                  name="username"
+                  placeholder="Username"
+                  value={form.username}
+                  onChange={handleChange}
+                  required
+                  disabled={isLoading}
+                  whileFocus={{ scale: 1.02 }}
+                />
+                <InputField
+                  type="email"
+                  name="email"
+                  placeholder="Email Address"
+                  value={form.email}
+                  onChange={handleChange}
+                  required
+                  disabled={isLoading}
+                  whileFocus={{ scale: 1.02 }}
+                />
+                <InputField
+                  type="password"
+                  name="password"
+                  placeholder="Password"
+                  value={form.password}
+                  onChange={handleChange}
+                  onFocus={handlePasswordFocus}
+                  onBlur={handlePasswordBlur}
+                  required
+                  disabled={isLoading}
+                  whileFocus={{ scale: 1.02 }}
+                />
+                
+                <AnimatePresence>
+                  {showPasswordRules && (
+                    <PasswordRules
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                    >
+                      <PasswordRule $valid={passwordValidation.length}>
+                        {passwordValidation.length ? <FaCheckCircle /> : <FaCircle className="dot" />} At least 8 characters
+                      </PasswordRule>
+                      <PasswordRule $valid={passwordValidation.notNumeric}>
+                        {passwordValidation.notNumeric ? <FaCheckCircle /> : <FaCircle className="dot" />} Not entirely numeric
+                      </PasswordRule>
+                      <PasswordRule $valid={passwordValidation.notSimilar}>
+                        {passwordValidation.notSimilar ? <FaCheckCircle /> : <FaCircle className="dot" />} Not similar to email/username
+                      </PasswordRule>
+                    </PasswordRules>
+                  )}
+                </AnimatePresence>
+                
+                <InputField
+                  type="password"
+                  name="password2"
+                  placeholder="Confirm Password"
+                  value={form.password2}
+                  onChange={handleChange}
+                  onFocus={handlePasswordFocus}
+                  onBlur={handlePasswordBlur}
+                  required
+                  disabled={isLoading}
+                  whileFocus={{ scale: 1.02 }}
+                />
+                
+                <AnimatePresence>
+                  {showPasswordRules && (
+                    <PasswordRule $valid={passwordValidation.matches} style={{ marginBottom: '0.75rem', marginTop: '-0.25rem' }}>
+                      {passwordValidation.matches ? <FaCheckCircle /> : <FaCircle className="dot" />} Passwords match
+                    </PasswordRule>
+                  )}
+                </AnimatePresence>
+
+                <SubmitButton
+                  type="submit"
+                  disabled={isLoading}
+                  whileHover={{ scale: isLoading ? 1 : 1.02 }}
+                  whileTap={{ scale: isLoading ? 1 : 0.98 }}
+                >
+                  {isLoading ? 'Registering...' : 'Create Account'}
+                </SubmitButton>
+              </form>
+              
+              <LoginLink>
+                Already have an account? <Link to="/login" state={{ from }}>Login now</Link>
+              </LoginLink>
+            </RegisterCard>
           </AuthWrapper>
         </GlowingPageContainer>
       </AppLayout>
@@ -255,15 +254,10 @@ const AuthWrapper = styled.div`
   display: flex;
   flex-direction: column;
   align-items: center;
-  /* 🚀 CRITICAL FIX: Changed from 'center' to 'flex-start'. 
-     This ensures the top is NEVER chopped off under the navbar. */
-  justify-content: flex-start; 
+  justify-content: center;
   width: 100%;
-  padding-top: 0.5rem; /* Just a tiny bit of breathing room */
-
-  @media (max-width: 768px) {
-    padding-top: 0;
-  }
+  min-height: 64vh; /* Matches the login page positioning perfectly */
+  box-sizing: border-box;
 `;
 
 const RegisterCard = styled(motion.div)`
@@ -274,55 +268,37 @@ const RegisterCard = styled(motion.div)`
   border-radius: 24px;
   box-shadow: 0 15px 40px -10px rgba(0, 0, 0, 0.1);
   width: 100%;
-  max-width: 420px; /* 🚀 Slimmed down slightly */
+  max-width: 420px;
   text-align: center;
   box-sizing: border-box;
   margin: 0 auto;
-
-  /* 🚀 Reduced top/bottom padding heavily */
-  padding: 1.5rem 2rem; 
+  padding: 1.25rem 1.75rem; 
 
   h1 {
-    margin: 0.5rem 0 0.25rem 0;
+    margin: 0.3rem 0 0.15rem 0;
     font-size: 1.4rem;
   }
 
   p {
-    margin: 0 0 1rem 0;
+    margin: 0 0 0.75rem 0;
     font-size: 0.85rem;
   }
 
   form {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem; /* Tightened the gap between inputs */
-  }
-
-  /* 🔥 THE FAT TRIMMER: Forcibly shrink the height of inputs and buttons 🔥 */
-  input {
-    padding: 0.65rem 1rem !important; 
-    font-size: 0.9rem !important;
-    border-radius: 10px !important;
-  }
-
-  button {
-    padding: 0.75rem 1rem !important;
-    margin-top: 0.25rem !important;
-    font-size: 0.95rem !important;
+    gap: 0.5rem; 
   }
 
   @media (max-width: 768px) {
-      padding: 1.5rem 1rem;
-      margin: 1rem auto;
-      width: 95%; /* Gives just a tiny sliver of space on the edges to prove it's a card */
-      
-      /* 🔥 THE GLASS RESTORATION 🔥 */
-      background: rgba(255, 255, 255, 0.65);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 255, 255, 0.8);
-      border-radius: 20px;
-      box-shadow: 0 10px 30px -10px rgba(11, 132, 87, 0.1);
+    padding: 1.25rem 1rem;
+    width: 95%;
+    background: rgba(255, 255, 255, 0.65);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.8);
+    border-radius: 20px;
+    box-shadow: 0 10px 30px -10px rgba(11, 132, 87, 0.1);
   }
 `;
 
@@ -333,50 +309,38 @@ const IconWrapper = styled(motion.div)`
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.1);
-  
-  /* 🚀 Shrunk the icon slightly */
-  width: 48px;
-  height: 48px;
-  margin: 0 auto 0.5rem auto; 
+  box-shadow: 0 0 0 5px rgba(16, 185, 129, 0.1);
+  width: 40px;
+  height: 40px;
+  margin: 0 auto 0.4rem auto; 
   
   svg {
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 768px) {
-    width: 44px;
-    height: 44px;
-    svg {
-      width: 20px;
-      height: 20px;
-    }
+    width: 18px;
+    height: 18px;
   }
 `;
 
 const Title = styled.h1`
   color: #0F172A;
-  margin: 0 0 0.5rem 0;
-  font-size: 1.8rem;
+  margin: 0 0 0.2rem 0;
+  font-size: 1.6rem;
   font-weight: 900;
   letter-spacing: -0.5px;
 `;
 
 const Subtitle = styled.p`
   color: #64748B;
-  font-size: 1rem;
-  margin-bottom: 2rem;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
 `;
 
 const InputField = styled(motion.input)`
   width: 100%;
-  padding: 1.1rem 1.2rem;
-  margin-bottom: 1.2rem;
+  padding: 0.75rem 1rem;
   border: 1px solid #E2E8F0;
   background: #F8FAFC;
-  border-radius: 14px;
-  font-size: 1rem;
+  border-radius: 12px;
+  font-size: 0.9rem;
   color: #0F172A;
   transition: all 0.3s ease;
   box-sizing: border-box;
@@ -391,74 +355,60 @@ const InputField = styled(motion.input)`
 
 const PasswordRules = styled(motion.div)`
   text-align: left;
-  margin: -0.5rem 0 1.2rem 0;
+  margin: -0.25rem 0 0.5rem 0;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.3rem;
 `;
 
 const PasswordRule = styled.div`
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  font-size: 0.85rem;
+  gap: 0.4rem;
+  font-size: 0.8rem;
   font-weight: 600;
   color: ${props => props.$valid ? '#059669' : '#94A3B8'};
   transition: color 0.3s ease;
   
-  svg { font-size: 1rem; }
-  .dot { font-size: 0.5rem; margin-left: 0.25rem; margin-right: 0.25rem; color: #CBD5E1; }
+  svg { font-size: 0.9rem; }
+  .dot { font-size: 0.4rem; margin-left: 0.2rem; margin-right: 0.2rem; color: #CBD5E1; }
 `;
 
 const SubmitButton = styled(motion.button)`
   width: 100%;
-  padding: 1.1rem;
+  padding: 0.85rem;
   background: linear-gradient(135deg, #0B8457 0%, #075E3E 100%);
   color: white;
   border: none;
-  border-radius: 14px;
-  font-size: 1.05rem;
+  border-radius: 12px;
+  font-size: 1rem;
   font-weight: 800;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.6rem;
-  margin-top: 0.5rem;
-  box-shadow: 0 6px 20px rgba(11, 132, 87, 0.25);
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+  box-shadow: 0 4px 15px rgba(11, 132, 87, 0.25);
   transition: all 0.3s ease;
   position: relative;
   overflow: hidden;
 
-  &::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -150%;
-    width: 50%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.25), transparent);
-    transform: skewX(-25deg);
-    animation: shimmer 4s infinite;
-  }
-  
-  @keyframes shimmer { 0% { left: -150%; } 20% { left: 200%; } 100% { left: 200%; } }
-
-  &:hover:not(:disabled) { box-shadow: 0 8px 25px rgba(11, 132, 87, 0.4); }
-  &:disabled { opacity: 0.7; cursor: not-allowed; &::after { display: none; } }
+  &:hover:not(:disabled) { box-shadow: 0 6px 20px rgba(11, 132, 87, 0.4); }
+  &:disabled { opacity: 0.7; cursor: not-allowed; }
 `;
 
 const LoginLink = styled.div`
-  margin-top: 2rem;
+  margin-top: 1rem;
   color: #64748B;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
 
   a {
     color: #0B8457;
     text-decoration: none;
     font-weight: 700;
-    margin-left: 5px;
+    margin-left: 4px;
     transition: color 0.2s ease;
 
     &:hover { color: #075E3E; text-decoration: underline; }

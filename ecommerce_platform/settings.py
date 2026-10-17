@@ -34,7 +34,10 @@ ALLOWED_HOSTS = [
     '.vercel.app',
     '.onrender.com',
     'localhost',
-    '127.0.0.1'
+    '127.0.0.1',
+    'thread-sedative-tinker.ngrok-free.dev',
+    'eazyshop.cfd',
+    '.eazyshop.cfd',
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -42,13 +45,25 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = False
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",      
+    "http://localhost:3000",
     "https://django-react-ecommerce-platform.vercel.app",
+    "https://eazyshop-store.vercel.app",
+    "https://eazyshop.cfd",
+    "https://www.eazyshop.cfd",
+    "http://eazyshop.cfd",
+    "http://www.eazyshop.cfd",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://django-react-ecommerce-platform.vercel.app",
+    "https://eazyshop-store.vercel.app",
+    "https://eazyshop.cfd",
+    "https://www.eazyshop.cfd",
+    "http://eazyshop.cfd",
+    "http://www.eazyshop.cfd",
 ]
+
+FRONTEND_URL = config('FRONTEND_URL', default='https://eazyshop.cfd')
 
 # 🚀 Cross-Domain Cookie Security Flags (MANDATORY FOR VERCEL + RENDER)
 SESSION_COOKIE_SAMESITE = 'None'
@@ -86,7 +101,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    
+
 ]
 
 AUTHENTICATION_BACKENDS = [
@@ -128,7 +143,7 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         # 🚀 Tells DRF to read the JWT from your HTTP-Only cookies instead of headers
         'api.authenticate.CustomCookieAuthentication',
-        
+
         # Keep TokenAuthentication if you use it for other apps/tokens
         'rest_framework.authentication.TokenAuthentication',
     ),
@@ -188,14 +203,14 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 SIMPLE_JWT = {
     # 🚀 Secure access lifetime (forces frequent permission checks without nagging the user)
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=10),
-    
+
     # 🚀 Long refresh lifetime so users don't have to log in every day
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
-    
+
     # Keep rotation/blacklisting turned off since you aren't using the blacklist app
     'ROTATE_REFRESH_TOKENS': False,
     'BLACKLIST_AFTER_ROTATION': False,
-    
+
     'AUTH_HEADER_TYPES': ('Bearer',),
     'USER_ID_FIELD': 'id',
     'USER_ID_CLAIM': 'user_id',
@@ -209,7 +224,7 @@ USE_X_FORWARDED_HOST = True
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ANYMAIL = {
-    "SENDINBLUE_API_KEY": config('BREVO_API_KEY'), 
+    "SENDINBLUE_API_KEY": config('BREVO_API_KEY'),
 }
 
 EMAIL_BACKEND = "anymail.backends.sendinblue.EmailBackend"
@@ -225,3 +240,8 @@ STORAGES = {
         "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
     },
 }
+
+# Razorpay Payment Gateway Settings
+RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID')
+RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
+RAZORPAY_WEBHOOK_SECRET = config('RAZORPAY_WEBHOOK_SECRET')

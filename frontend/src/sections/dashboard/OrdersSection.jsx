@@ -5,6 +5,7 @@ import styled from 'styled-components';
 import AuthContext from '../../context/AuthContext';
 import { FaBoxOpen, FaBox, FaTruck, FaCheckCircle, FaTimesCircle, FaBan, FaStar, FaEdit, FaMapMarkerAlt, FaFileDownload } from 'react-icons/fa';
 import { toast } from "react-hot-toast";
+import { formatINR } from '../../utils/currency';
 
 const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, setOrderPage, userReviews, openReviewModal, onCancelOrderClick }) => {
   const { axiosInstance } = useContext(AuthContext);
@@ -106,7 +107,7 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
             )}
             
             <OrderFooterRow>
-              <OrderTotal>Total: <span>${Number(order.total_price)?.toFixed(2)}</span></OrderTotal>
+              <OrderTotal>Total: <span>{formatINR(order.total_price)}</span></OrderTotal>
               
               <ActionGroup>
                 {/* 📄 Invoice Download Button */}
@@ -147,7 +148,7 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
                         </ItemImage>
                         <ItemDetails>
                           <h4>{item.name}</h4>
-                          <div className="meta"><span>Qty: {item.quantity}</span><span>${Number(item.price)?.toFixed(2)} each</span></div>
+                          <div className="meta"><span>Qty: {item.quantity}</span><span>{formatINR(item.price)} each</span></div>
                         </ItemDetails>
                         {order.status === 'delivered' && (
                            <ReviewTriggerButton $isEdit={!!existingReview} onClick={() => openReviewModal(item, existingReview)} whileTap={{ scale: 0.97 }}>

@@ -6,6 +6,7 @@ import AuthContext from '../context/AuthContext';
 import { toast } from "react-hot-toast";
 import { FaTimes, FaPlus, FaEdit, FaTrash, FaCheckCircle, FaStore } from 'react-icons/fa';
 import ModalPortal from '../components/ModalPortal';
+import { formatINR } from '../utils/currency';
 
 const ProductsSection = () => {
   const { axiosInstance } = useContext(AuthContext);
@@ -98,7 +99,7 @@ const ProductsSection = () => {
             <ContentColumn>
               <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
                 <div style={{ fontSize: '1.15rem', fontWeight: '800', color: '#0F172A' }}>
-                  {p.name} - <span style={{ color: '#0B8457', fontWeight: '900' }}>${Number(p.price).toFixed(2)}</span>
+                  {p.name} - <span style={{ color: '#0B8457', fontWeight: '900' }}>{formatINR(p.price)}</span>
                 </div>
                 <StatusBadge className={p.approval_status || 'approved'}>
                   {p.approval_status ? p.approval_status.toUpperCase() : 'APPROVED'}
@@ -164,7 +165,7 @@ const ProductsSection = () => {
               <AdminInput placeholder="Product Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
               <AdminTextarea placeholder="Description" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} />
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-                <AdminInput placeholder="Price ($)" type="number" value={form.price} onChange={e => setForm({ ...form, price: parseFloat(e.target.value) || '' })} />
+                <AdminInput placeholder="Price (₹)" type="number" value={form.price} onChange={e => setForm({ ...form, price: parseFloat(e.target.value) || '' })} />
                 <AdminInput placeholder="Stock" type="number" value={form.stock} onChange={e => setForm({ ...form, stock: parseInt(e.target.value) || '' })} />
               </div>
               <AdminSelect value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>

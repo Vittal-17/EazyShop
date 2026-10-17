@@ -7,7 +7,7 @@ import {
   FaSignInAlt, FaStore, FaClipboardList, 
   FaUserShield, FaSignOutAlt, FaHeart,
   FaChevronDown, FaBars, FaTimes, FaEnvelope,
-  FaTruck
+  FaTruck, FaGift
 } from 'react-icons/fa';
 import { motion, AnimatePresence } from 'framer-motion';
 import styled from 'styled-components';
@@ -59,6 +59,7 @@ const Navbar = () => {
     <>
       <CustomLink to="/" label="Home" icon={<FaHome />} currentPath={location.pathname} />
       <CustomLink to="/products" label="Store" icon={<FaStore />} currentPath={location.pathname} />
+      <CustomLink to="/gift-cards" label="Gift Cards" icon={<FaGift />} currentPath={location.pathname} />
       <CustomLink to="/cart" label="Cart" icon={<FaShoppingCart />} currentPath={location.pathname} />
       
       {user && (

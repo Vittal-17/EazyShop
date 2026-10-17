@@ -9,6 +9,7 @@ import { FaStar, FaShoppingCart, FaArrowRight, FaCheckCircle, FaStore, FaExclama
 import { SkeletonRow } from '../components/SkeletonLoader';
 import AppLayout from '../components/AppLayout';
 import { GlowingPageContainer } from '../styles/SharedPageStyles';
+import { formatINR } from '../utils/currency';
 
 const ProductDetail = () => {
   const { id } = useParams();
@@ -169,7 +170,7 @@ const ProductDetail = () => {
           </TopMetaRow>
 
           <Title>{product.name}</Title>
-          <Price>${Number(product.price).toFixed(2)}</Price>
+          <Price>{formatINR(product.price)}</Price>
 
           <ActionCard>
             <div className="row">

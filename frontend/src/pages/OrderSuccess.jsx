@@ -53,7 +53,7 @@ const OrderSuccess = () => {
                 <Divider />
                 <InfoRow><span>Payment Method:</span> <strong>{payment.payment_method.replace('_', ' ').toUpperCase()}</strong></InfoRow>
                 <InfoRow><span>Transaction ID:</span> <strong className="mono">{payment.transaction_id}</strong></InfoRow>
-                <InfoRow><span>Total Paid:</span> <strong className="highlight">${order.total_price}</strong></InfoRow>
+                <InfoRow><span>Total Paid:</span> <strong className="highlight">₹{order.total_price}</strong></InfoRow>
               </DetailCard>
 
               <DetailCard>

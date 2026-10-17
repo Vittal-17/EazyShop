@@ -2,186 +2,298 @@ import { useState, useEffect, useContext } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import styled from 'styled-components';
 import AuthContext from '../context/AuthContext';
-import { FaServer, FaDatabase, FaLock, FaCheck } from 'react-icons/fa';
+import ModalPortal from './ModalPortal'; 
+
+const WAKEUP_MESSAGES = [
+  "Spinning up eco-friendly standby container...",
+  "Restoring PostgreSQL database into memory...",
+  "Warming up global edge delivery networks...",
+  "Synchronizing secure EazyShop product catalogs...",
+  "Establishing zero-trust encrypted channels...",
+  "Verifying SSL handshake and TLS protocols...",
+  "Mounting persistent volume storage...",
+  "Almost ready — booting application runtime..."
+];
 
 const ServerWakeup = () => {
   const { axiosInstance } = useContext(AuthContext);
   const [isWaking, setIsWaking] = useState(false);
-  const [activeStep, setActiveStep] = useState(1);
+  const [currentMessage, setCurrentMessage] = useState("Initializing secure server environment...");
 
-  // 1. Initial Ping Logic
+  // 1. Robust Server Polling Logic
   useEffect(() => {
     let isMounted = true;
-    
-    // Show modal if server doesn't respond in 1.5s
+    let pingInterval;
+
     const timeout = setTimeout(() => {
       if (isMounted) setIsWaking(true);
-    }, 1500);
+    }, 1000);
 
     const pingServer = async () => {
       try {
         await axiosInstance.get('/api/categories/'); 
-        clearTimeout(timeout);
-        if (isMounted) setIsWaking(false);
+        if (isMounted) {
+          setIsWaking(false);
+          clearTimeout(timeout);
+          clearInterval(pingInterval);
+        }
       } catch (err) {
-        clearTimeout(timeout);
-        if (isMounted) setIsWaking(false);
+        // Server is asleep; continue polling silently
       }
     };
 
-   pingServer();
+    pingServer();
+    pingInterval = setInterval(pingServer, 6000);
 
     return () => {
       isMounted = false;
       clearTimeout(timeout);
+      clearInterval(pingInterval);
     };
   }, [axiosInstance]);
 
-  // 2. Deployment Stepper Logic (Updates every 10 seconds)
+  // 2. Randomized Message Engine
   useEffect(() => {
-    if (!isWaking) {
-      setActiveStep(1); // Reset if closed
-      return;
-    }
-    
-    const timer1 = setTimeout(() => setActiveStep(2), 10000);
-    const timer2 = setTimeout(() => setActiveStep(3), 20000);
+    if (!isWaking) return;
+
+    let isMounted = true;
+    let timeoutId;
+    let messageCount = 0;
+    const shuffledMessages = [...WAKEUP_MESSAGES].sort(() => 0.5 - Math.random()).slice(0, 4);
+
+    const scheduleNextMessage = () => {
+      if (messageCount >= 4 || !isMounted) return;
+      const randomDelay = Math.floor(Math.random() * (11000 - 6500 + 1) + 6500);
+
+      timeoutId = setTimeout(() => {
+        if (isMounted) {
+          setCurrentMessage(shuffledMessages[messageCount]);
+          messageCount++;
+          scheduleNextMessage();
+        }
+      }, randomDelay);
+    };
+
+    scheduleNextMessage();
 
     return () => {
-      clearTimeout(timer1);
-      clearTimeout(timer2);
+      isMounted = false;
+      clearTimeout(timeoutId);
     };
   }, [isWaking]);
-
-  const steps = [
-    { id: 1, title: "Waking Environment", desc: "Booting up the cloud instance from standby mode.", icon: <FaServer /> },
-    { id: 2, title: "Restoring Database", desc: "Loading product catalog and user data into memory.", icon: <FaDatabase /> },
-    { id: 3, title: "Securing Channels", desc: "Establishing encrypted connections for your session.", icon: <FaLock /> }
-  ];
 
   return (
     <AnimatePresence>
       {isWaking && (
-        <Overlay initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-          <ModalBox 
-            initial={{ scale: 0.9, opacity: 0, y: 20 }} 
-            animate={{ scale: 1, opacity: 1, y: 0 }} 
-            exit={{ scale: 0.9, opacity: 0, y: 20 }}
+        <ModalPortal>
+          <Overlay 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.5 }}
           >
-            
-            <Header>
-              <h2>Initializing EazyShop's Servers</h2>
-              <p>Our eco-friendly servers are waking up from standby. This process takes about 30 seconds.</p>
-            </Header>
+            <GreenOrbTop />
+            <GreenOrbBottom />
 
-            <StepList>
-              {steps.map(step => {
-                const isActive = step.id === activeStep;
-                const isCompleted = step.id < activeStep;
-                const isPending = step.id > activeStep;
+            <GlassModal
+              initial={{ scale: 0.85, opacity: 0, y: 30 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.85, opacity: 0, y: 30 }}
+              transition={{ type: "spring", stiffness: 250, damping: 25 }}
+            >
+              
+              <SpinnerContainer>
+                <OuterRing 
+                  animate={{ rotate: 360 }} 
+                  transition={{ duration: 12, repeat: Infinity, ease: "linear" }} 
+                />
                 
-                return (
-                  <StepCard 
-                    key={step.id} 
-                    $active={isActive} 
-                    $completed={isCompleted}
-                    animate={{ opacity: isPending ? 0.4 : 1 }}
-                  >
-                    <StepIcon $active={isActive} $completed={isCompleted}>
-                      {isCompleted ? <FaCheck /> : step.icon}
-                    </StepIcon>
-                    
-                    <StepText>
-                      <h4>{step.title}</h4>
-                      <p>{step.desc}</p>
-                    </StepText>
-                    
-                    {isActive && (
-                      <ActivePing 
-                        animate={{ scale: [1, 1.4, 1], opacity: [0.8, 0, 0.8] }} 
-                        transition={{ repeat: Infinity, duration: 1.5 }} 
-                      />
-                    )}
-                  </StepCard>
-                );
-              })}
-            </StepList>
+                <InnerRing 
+                  animate={{ rotate: -360 }} 
+                  transition={{ duration: 4, repeat: Infinity, ease: "linear" }} 
+                />
+                
+                <CenterPulse
+                  animate={{ scale: [1, 1.08, 1], boxShadow: ["0 0 15px rgba(16,185,129,0.3)", "0 0 35px rgba(16,185,129,0.7)", "0 0 15px rgba(16,185,129,0.3)"] }}
+                  transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
+                >
+                  {/* 🚀 Using your custom logo asset */}
+                  <LogoImg src="/android-chrome-512x512.png" alt="EazyShop Logo" />
+                </CenterPulse>
+              </SpinnerContainer>
 
-            <ProgressBarContainer>
-              <ProgressFill 
-                initial={{ width: "0%" }} 
-                animate={{ width: "100%" }} 
-                transition={{ duration: 30, ease: "linear" }} 
-              />
-            </ProgressBarContainer>
+              <TextContainer>
+                <h2>Waking EazyShop Server</h2>
+                <SubText>
+                  Our eco-friendly backend instance spins down automatically during periods of inactivity to conserve cloud resources. Please hang tight for a moment while we spin it back online for you!
+                </SubText>
+                
+                <MessageWrapper>
+                  <AnimatePresence mode="wait">
+                    <AnimatedMessage 
+                      key={currentMessage}
+                      initial={{ opacity: 0, y: 12 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -12 }}
+                      transition={{ duration: 0.35 }}
+                    >
+                      {currentMessage}
+                    </AnimatedMessage>
+                  </AnimatePresence>
+                </MessageWrapper>
+              </TextContainer>
 
-          </ModalBox>
-        </Overlay>
+            </GlassModal>
+          </Overlay>
+        </ModalPortal>
       )}
     </AnimatePresence>
   );
 };
 
 // ==========================================
-// UNIQUE STYLED COMPONENTS
+// ENTERPRISE GLASSMORPHISM STYLES
 // ==========================================
+
 const Overlay = styled(motion.div)`
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(6px);
+  position: fixed; inset: 0;
+  background: rgba(15, 23, 42, 0.75); 
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
   display: flex; align-items: center; justify-content: center; z-index: 9999;
   padding: 1rem;
+  overflow: hidden;
 `;
 
-const ModalBox = styled(motion.div)`
-  background: white; padding: 2.5rem 2rem; border-radius: 24px;
-  max-width: 480px; width: 100%; box-shadow: 0 25px 50px rgba(0,0,0,0.3);
+const GreenOrbTop = styled.div`
+  position: absolute; top: 10%; left: 15%; width: 450px; height: 450px;
+  background: radial-gradient(circle, rgba(16, 185, 129, 0.4) 0%, transparent 70%);
+  border-radius: 50%; pointer-events: none; z-index: 0; filter: blur(60px);
 `;
 
-const Header = styled.div`
-  text-align: center; margin-bottom: 2rem;
-  h2 { color: #111; font-size: 1.6rem; margin: 0 0 0.5rem 0; font-weight: 800; }
-  p { color: #666; font-size: 0.95rem; line-height: 1.5; margin: 0; padding: 0 1rem; }
+const GreenOrbBottom = styled.div`
+  position: absolute; bottom: 10%; right: 15%; width: 550px; height: 550px;
+  background: radial-gradient(circle, rgba(11, 132, 87, 0.35) 0%, transparent 70%);
+  border-radius: 50%; pointer-events: none; z-index: 0; filter: blur(70px);
 `;
 
-const StepList = styled.div`
-  display: flex; flex-direction: column; gap: 0.8rem; margin-bottom: 2rem;
+const GlassModal = styled(motion.div)`
+  position: relative; z-index: 1;
+  background: linear-gradient(135deg, rgba(209, 250, 229, 0.92) 0%, rgba(236, 253, 245, 0.85) 100%); 
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+  padding: 3.5rem 2.5rem; 
+  border-radius: 36px;
+  max-width: 480px; width: 100%; 
+  box-shadow: 0 40px 80px -20px rgba(11, 132, 87, 0.45), inset 0 2px 8px rgba(255,255,255,0.9);
+  border: 1.5px solid rgba(16, 185, 129, 0.2);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  overflow: hidden;
+
+  /* 🚀 Sleek inset curved border matching your markup */
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 14px; /* Controls how far in the border sits from the outer edge */
+    border: 1.5px solid rgba(16, 185, 129, 0.55); /* Site-themed green light border */
+    border-radius: 26px; /* Smooth curved corners nested inside */
+    pointer-events: none;
+  }
 `;
 
-const StepCard = styled(motion.div)`
-  display: flex; align-items: center; gap: 1.2rem; padding: 1.2rem;
-  border-radius: 16px;
-  background: ${props => props.$active ? '#f1f8e9' : '#ffffff'};
-  border: 1.5px solid ${props => props.$active ? '#81c784' : props.$completed ? '#e0e0e0' : 'transparent'};
-  box-shadow: ${props => props.$completed ? '0 2px 8px rgba(0,0,0,0.04)' : 'none'};
-  transition: all 0.3s ease;
+const SpinnerContainer = styled.div`
+  position: relative;
+  width: 140px;
+  height: 140px;
+  margin-bottom: 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 `;
 
-const StepIcon = styled.div`
-  width: 42px; height: 42px; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center; font-size: 1.2rem;
-  background: ${props => props.$active ? '#4caf50' : props.$completed ? '#e8f5e9' : '#f5f5f5'};
-  color: ${props => props.$active ? 'white' : props.$completed ? '#2e7d32' : '#bdbdbd'};
-  transition: all 0.3s ease; flex-shrink: 0;
+const OuterRing = styled(motion.div)`
+  position: absolute;
+  inset: 0;
+  border: 3px dashed rgba(16, 185, 129, 0.45);
+  border-radius: 50%;
 `;
 
-const StepText = styled.div`
-  text-align: left; flex: 1;
-  h4 { margin: 0 0 0.2rem 0; color: #333; font-size: 1rem; font-weight: 700; }
-  p { margin: 0; color: #757575; font-size: 0.85rem; line-height: 1.4; }
+const InnerRing = styled(motion.div)`
+  position: absolute;
+  inset: 12px;
+  border: 4px solid transparent;
+  border-top: 4px solid #0B8457;
+  border-right: 4px solid #10B981;
+  border-radius: 50%;
+  opacity: 0.9;
 `;
 
-const ActivePing = styled(motion.div)`
-  width: 12px; height: 12px; border-radius: 50%;
-  background: #4caf50; box-shadow: 0 0 10px #4caf50;
-  margin-left: 0.5rem; flex-shrink: 0;
+const CenterPulse = styled(motion.div)`
+  position: relative;
+  width: 76px;
+  height: 76px;
+  background: #ffffff;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 3px solid #10B981;
+  z-index: 2;
+  overflow: hidden;
+  box-shadow: 0 8px 20px rgba(11, 132, 87, 0.2);
 `;
 
-const ProgressBarContainer = styled.div`
-  width: 100%; height: 6px; background: #e0e0e0; border-radius: 10px; overflow: hidden;
+const LogoImg = styled.img`
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 `;
 
-const ProgressFill = styled(motion.div)`
-  height: 100%; background: linear-gradient(90deg, #81c784, #2e7d32); border-radius: 10px;
+const TextContainer = styled.div`
+  width: 100%;
+  
+  h2 { 
+    color: #0F172A; 
+    font-size: 1.7rem; 
+    margin: 0 0 0.75rem 0; 
+    font-weight: 900; 
+    letter-spacing: -0.5px; 
+  }
+`;
+
+const SubText = styled.p`
+  color: #475569;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  margin: 0 0 1.75rem 0;
+  padding: 0 0.5rem;
+`;
+
+const MessageWrapper = styled.div`
+  height: 2.5rem; 
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 🚀 Matching richer green background tint for the message box */
+  background: rgba(16, 185, 129, 0.15);
+  border-radius: 12px;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  padding: 0 1rem;
+`;
+
+const AnimatedMessage = styled(motion.p)`
+  color: #0B8457; 
+  font-size: 0.9rem; 
+  font-weight: 700;
+  line-height: 1.4; 
+  margin: 0;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 `;
 
 export default ServerWakeup;

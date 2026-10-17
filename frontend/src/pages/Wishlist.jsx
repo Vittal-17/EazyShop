@@ -10,6 +10,7 @@ import { SkeletonProductCard } from '../components/SkeletonLoader';
 import {PageHeader,GlowingPageContainer} from '../styles/SharedPageStyles';
 import AppLayout from '../components/AppLayout';
 import ModalPortal from '../components/ModalPortal';
+import { formatINR } from '../utils/currency';
 
 const Wishlist = () => {
   const { axiosInstance } = useContext(AuthContext);
@@ -224,7 +225,7 @@ const Wishlist = () => {
                     <Link to={`/products/${item.product.id}/`} className="title">
                       {item.product.name}
                     </Link>
-                    <Price>${item.product.price.toFixed(2)}</Price>
+                    <Price>{formatINR(item.product.price)}</Price>
                   </Info>
 
                   <Actions>

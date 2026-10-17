@@ -6,6 +6,7 @@ import AuthContext from '../context/AuthContext';
 import { toast } from "react-hot-toast";
 import { FaTimes, FaClock, FaShippingFast, FaCheckCircle, FaTimesCircle, FaEdit } from 'react-icons/fa';
 import ModalPortal from '../components/ModalPortal';
+import { formatINR } from '../utils/currency';
 
 const OrdersSection = () => {
   const { axiosInstance } = useContext(AuthContext);
@@ -86,7 +87,7 @@ const OrdersSection = () => {
                   <div>
                     <div style={{ fontSize: '1.15rem', fontWeight: '800', color: '#0F172A' }}>Order #{o.id}</div>
                     <div style={{ color: '#64748B', marginTop: '0.3rem', fontSize: '0.95rem' }}>Customer: <strong style={{ color: '#0F172A' }}>{o.username}</strong></div>
-                    <div style={{ color: '#0B8457', fontWeight: '900', marginTop: '0.4rem', fontSize: '1.2rem' }}>Total: ${Number(o.total_price).toFixed(2)}</div>
+                    <div style={{ color: '#0B8457', fontWeight: '900', marginTop: '0.4rem', fontSize: '1.2rem' }}>Total: {formatINR(o.total_price)}</div>
                   </div>
                   <StatusTriggerButton 
                     $bg={config.bg} $fg={config.fg} onClick={() => setActiveOrder(o)}

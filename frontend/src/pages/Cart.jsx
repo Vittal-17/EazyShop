@@ -10,6 +10,7 @@ import { FaTrashAlt, FaHeart, FaRegHeart, FaArrowRight, FaShieldAlt, FaExclamati
 import { PageHeader, GlowingPageContainer } from '../styles/SharedPageStyles';
 import AppLayout from '../components/AppLayout';
 import ModalPortal from '../components/ModalPortal';
+import { formatINR } from '../utils/currency';
 
 const ConfirmationModal = ({ isOpen, onClose, onConfirm }) => {
   return (
@@ -212,11 +213,11 @@ const Cart = () => {
                       <ProductDetails>
                         <div className="title-row">
                           <Link to={`/products/${item.product}`} className="title">{item.product_name}</Link>
-                          <TotalPrice>${(item.quantity * Number(item.price)).toFixed(2)}</TotalPrice>
+                          <TotalPrice>{formatINR((item.quantity * Number(item.price)))}</TotalPrice>
                         </div>
                         
                         <div className="price-row">
-                          <UnitPrice>${Number(item.price).toFixed(2)} each</UnitPrice>
+                          <UnitPrice>{formatINR(item.price)} each</UnitPrice>
                         </div>
 
                         <ControlsRow>
@@ -243,7 +244,7 @@ const Cart = () => {
                   <h3>Order Summary</h3>
                   <div className="summary-row">
                     <span>Subtotal</span>
-                    <span>${cartTotal.toFixed(2)}</span>
+                    <span>{formatINR(cartTotal)}</span>
                   </div>
                   <div className="summary-row">
                     <span>Shipping</span>
@@ -252,7 +253,7 @@ const Cart = () => {
                   <div className="summary-divider"></div>
                   <div className="summary-total">
                     <span>Total</span>
-                    <span>${cartTotal.toFixed(2)}</span>
+                    <span>{formatINR(cartTotal)}</span>
                   </div>
 
                   <CheckoutButton onClick={handleProceedToCheckout} whileTap={{ scale: 0.98 }}>

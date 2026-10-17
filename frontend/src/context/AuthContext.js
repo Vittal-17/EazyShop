@@ -1,14 +1,14 @@
-// AuthContext.jsx
+// src/context/AuthContext.js
 import { createContext, useEffect, useState, useMemo } from 'react';
 import axios from 'axios';
 import toast from 'react-hot-toast';
 import { useNavigate } from 'react-router-dom';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
-const AuthContext = createContext();
+export const AuthContext = createContext();
 
 // ==========================================
-// 🚀 AXIOS REFRESH QUEUE STATE (Placed outside to persist across renders)
+// 🚀 AXIOS REFRESH QUEUE STATE
 // ==========================================
 let isRefreshing = false;
 let failedQueue = [];
@@ -43,10 +43,7 @@ export const AuthProvider = ({ children }) => {
       async (error) => {
         const originalRequest = error.config;
 
-        // If 401 Unauthorized and we haven't retried yet
         if (error.response?.status === 401 && !originalRequest._retry) {
-          
-          // 🚀 STAMPEDE FIX: IF REFRESH IS IN PROGRESS, QUEUE THE REQUEST
           if (isRefreshing) {
             return new Promise(function(resolve, reject) {
               failedQueue.push({ resolve, reject });
@@ -57,23 +54,15 @@ export const AuthProvider = ({ children }) => {
             });
           }
 
-          // Lock the queue
           originalRequest._retry = true;
           isRefreshing = true;
 
           try {
-            // 🚀 Hit refresh endpoint
             await instance.post('/api/token/refresh/');
-            
-            // Unlock queue and process waiting requests
             processQueue(null);
-            
-            // Backend set new access_token cookie; retry original request
             return instance(originalRequest);
           } catch (refreshErr) {
-            // If refresh fails, reject queue and log out
             processQueue(refreshErr, null);
-            
             localStorage.removeItem('user');
             setUser(null);
 
@@ -84,7 +73,6 @@ export const AuthProvider = ({ children }) => {
             navigate('/login');
             return Promise.reject(refreshErr);
           } finally {
-            // Reset the lock when done
             isRefreshing = false;
           }
         }
@@ -95,7 +83,26 @@ export const AuthProvider = ({ children }) => {
     return instance;
   }, [navigate]);
 
-  // 2. HYDRATION ON MOUNT
+  // 🚀 HELPER: Fetch absolute latest user profile from backend database
+  const refreshUser = async () => {
+    try {
+      const storedUser = localStorage.getItem('user');
+      if (storedUser) {
+        const parsedUser = JSON.parse(storedUser);
+        if (parsedUser && parsedUser.id) {
+          const response = await axiosInstance.get(`/api/users/${parsedUser.id}/`);
+          setUser(response.data);
+          localStorage.setItem('user', JSON.stringify(response.data));
+          return response.data;
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh user profile:', err);
+    }
+    return null;
+  };
+
+  // 2. HYDRATION & PRODUCTION FRESHNESS CHECK ON MOUNT
   useEffect(() => {
     const initializeAuth = async () => {
       const storedUser = localStorage.getItem('user');
@@ -103,14 +110,13 @@ export const AuthProvider = ({ children }) => {
       if (storedUser) {
         try {
           const parsedUser = JSON.parse(storedUser);
+          setUser(parsedUser);
 
-          // Self-healing check: fetch fresh data using the correct ID endpoint
-          if (!parsedUser.profile_picture && parsedUser.id) {
+          // Always fetch fresh data on mount to prevent production caching desync
+          if (parsedUser && parsedUser.id) {
             const response = await axiosInstance.get(`/api/users/${parsedUser.id}/`);
             setUser(response.data);
             localStorage.setItem('user', JSON.stringify(response.data));
-          } else {
-            setUser(parsedUser);
           }
         } catch (error) {
           console.error('Session initialization error:', error);
@@ -127,7 +133,6 @@ export const AuthProvider = ({ children }) => {
   // 3. LOGIN USER METHOD
   const loginUser = async (email, password) => {
     try {
-      // 🚀 Include credentials so set-cookie headers are accepted by browser
       const res = await axios.post(
         `${API_URL}/api/token/`,
         { email, password },
@@ -137,13 +142,10 @@ export const AuthProvider = ({ children }) => {
       if (res.status === 200) {
         const { user: userData } = res.data;
 
-        // Store ONLY non-sensitive user metadata in localStorage for UI state
         localStorage.setItem('user', JSON.stringify(userData));
         setUser(userData);
 
-        // ==========================================
-        // THE MERGE ALGORITHM (UPDATED FOR COOKIES)
-        // ==========================================
+        // Guest cart sync algorithm
         const tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
 
         if (tempCart.length > 0) {
@@ -151,7 +153,6 @@ export const AuthProvider = ({ children }) => {
 
           for (const item of tempCart) {
             try {
-              // 🚀 Uses axiosInstance withCredentials—no manual Authorization header needed!
               await axiosInstance.post('/api/cart-items/', {
                 product: item.product,
                 quantity: item.quantity,
@@ -173,10 +174,38 @@ export const AuthProvider = ({ children }) => {
     return false;
   };
 
-  // 4. LOGOUT USER METHOD
+  // 4. CROSS-TAB WALLET SYNC (BroadcastChannel)
+  useEffect(() => {
+    const channel = new BroadcastChannel('eazyshop_wallet_sync');
+    channel.onmessage = (event) => {
+      if (event.data?.type === 'SYNC_WALLET') {
+        setUser((prevUser) => {
+          if (prevUser && prevUser.id === event.data.userId) {
+            const updatedUser = { ...prevUser, wallet_balance: event.data.newBalance };
+            localStorage.setItem('user', JSON.stringify(updatedUser));
+            return updatedUser;
+          }
+          return prevUser;
+        });
+      }
+    };
+    return () => channel.close();
+  }, []);
+
+  const syncWalletBalance = (userId, newBalance) => {
+    setUser((prev) => {
+      const updatedUser = prev ? { ...prev, wallet_balance: newBalance } : prev;
+      if (updatedUser) localStorage.setItem('user', JSON.stringify(updatedUser));
+      return updatedUser;
+    });
+    const channel = new BroadcastChannel('eazyshop_wallet_sync');
+    channel.postMessage({ type: 'SYNC_WALLET', userId, newBalance });
+    channel.close();
+  };
+
+  // 5. LOGOUT USER METHOD
   const logoutUser = async () => {
     try {
-      // Notify backend to clear HTTP-Only cookies
       await axiosInstance.post('/api/logout/');
     } catch (err) {
       console.error('Logout error:', err);
@@ -188,7 +217,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loginUser, logoutUser, axiosInstance }}>
+    <AuthContext.Provider value={{ user, setUser, loginUser, logoutUser, axiosInstance, syncWalletBalance, refreshUser }}>
       {!loading && children}
     </AuthContext.Provider>
   );

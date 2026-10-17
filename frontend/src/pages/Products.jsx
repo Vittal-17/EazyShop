@@ -9,6 +9,7 @@ import { Link } from 'react-router-dom';
 import { SkeletonProductCard } from '../components/SkeletonLoader';
 import AppLayout from '../components/AppLayout';
 import { PageHeader, GlowingPageContainer } from '../styles/SharedPageStyles';
+import { formatINR } from '../utils/currency';
 
 const Products = () => {
   const { axiosInstance, user } = useContext(AuthContext);
@@ -245,7 +246,7 @@ const Products = () => {
                     <ThumbInput type="range" min="0" max={highestPrice} value={minPrice} onChange={(e) => setMinPrice(Math.min(Number(e.target.value), maxPrice - 1))} style={{ zIndex: minPrice > highestPrice * 0.9 ? 5 : 3 }} />
                     <ThumbInput type="range" min="0" max={highestPrice} value={maxPrice} onChange={(e) => setMaxPrice(Math.max(Number(e.target.value), minPrice + 1))} />
                   </SliderTrack>
-                  <PriceLabel>${minPrice} - ${maxPrice}</PriceLabel>
+                  <PriceLabel>₹{minPrice} - ₹{maxPrice}</PriceLabel>
                 </PriceSliderContainer>
 
                 <ToggleSwitch>
@@ -318,7 +319,7 @@ const Products = () => {
                       </div>
 
                       <PriceRow>
-                        <Price>${safePrice.toFixed(2)}</Price>
+                        <Price>{formatINR(safePrice)}</Price>
 
                         <QuantityControl>
                           <button onClick={() => setQuantities(prev => ({ ...prev, [product.id]: Math.max(1, (prev[product.id] || 1) - 1) }))} disabled={qty <= 1}>-</button>

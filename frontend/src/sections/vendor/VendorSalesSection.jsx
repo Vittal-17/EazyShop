@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';// eslint-disable-next-line
 import { FaTruck, FaBoxOpen, FaMoneyBillWave, FaShieldAlt, FaMapMarkerAlt, FaUser } from 'react-icons/fa';
 import { toast } from 'react-hot-toast';
 import AuthContext from '../../context/AuthContext';
+import { formatINR } from '../../utils/currency';
 
 const VendorSalesSection = () => {
   const { axiosInstance } = useContext(AuthContext);
@@ -86,7 +87,7 @@ const VendorSalesSection = () => {
       <StatsCard whileHover={{ y: -2 }} transition={{ duration: 0.2 }}>
         <div className="stat-info">
           <p>Total Net Earnings</p>
-          <h2>${totalEarnings.toFixed(2)}</h2>
+          <h2>{formatINR(totalEarnings)}</h2>
         </div>
         <FaMoneyBillWave size={48} color="#ffffff" opacity={0.25} />
       </StatsCard>
@@ -108,7 +109,7 @@ const VendorSalesSection = () => {
                     {(sale.status || 'pending').toUpperCase()}
                   </span>
                 </div>
-                <EarningsBadge>+ ${Number(sale.seller_earnings || 0).toFixed(2)}</EarningsBadge>
+                <EarningsBadge>+ {formatINR(sale.seller_earnings || 0)}</EarningsBadge>
               </SaleHeader>
               
               <SaleBody>
@@ -118,7 +119,7 @@ const VendorSalesSection = () => {
                   </div>
                   <div>
                     <h4>{sale.name}</h4>
-                    <p>Qty: {sale.quantity} <span>•</span> Price: ${sale.price}</p>
+                    <p>Qty: {sale.quantity} <span>•</span> Price: ₹{sale.price}</p>
                   </div>
                 </div>
 

@@ -3,6 +3,8 @@ from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
 # Explicit imports are safer than *
 from .models import (
+    GiftCard,
+    GiftCardTransaction,
     Address,
     AdminLog,
     Cart,
@@ -87,3 +89,5 @@ class CartAdmin(admin.ModelAdmin):
 class CartItemAdmin(admin.ModelAdmin):
     list_display = ('cart', 'product', 'quantity')
     search_fields = ('product__name', 'cart__user__username')
+admin.site.register(GiftCard)
+admin.site.register(GiftCardTransaction)

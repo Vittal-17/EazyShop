@@ -23,7 +23,7 @@ const ProductCard = ({ product, quantity, setQuantity, addToCart }) => {
       {/* Rest of the card */}
       <h2 className="text-lg font-semibold text-center mb-2">{product.name}</h2>
       <p className="text-sm text-gray-600 text-center mb-2">{product.description}</p>
-      <p className="text-md font-bold text-center mb-1">${product.price}</p>
+      <p className="text-md font-bold text-center mb-1">₹{product.price}</p>
       <p className="text-xs text-gray-500 mb-4">Stock: {product.stock}</p>
 
       <div className="flex items-center space-x-2">

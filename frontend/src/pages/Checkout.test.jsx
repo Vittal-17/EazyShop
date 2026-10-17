@@ -59,8 +59,8 @@ describe('Checkout Component', () => {
     const phoneInput = screen.getByPlaceholderText('(XXX) XXX-XXXX');
     expect(phoneInput.value).toBe('(123) 456-7890');
 
-    // 4. Verify Total Price calculation ($50 * 2 = $100)
-    expect(screen.getByText('$100.00')).toBeInTheDocument();
+    // 4. Verify Total Price calculation (₹50 * 2 = ₹100)
+    expect(screen.getByText('₹100.00')).toBeInTheDocument();
     
     // 5. Test clicking "Place Order" (Requires mocking the post requests)
     mockAxiosInstance.post.mockResolvedValueOnce({ data: { id: 999, total_price: '100.00' } }); // Mock Order Creation
