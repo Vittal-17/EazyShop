@@ -35,7 +35,9 @@ ALLOWED_HOSTS = [
     '.onrender.com',
     'localhost',
     '127.0.0.1',
-    'thread-sedative-tinker.ngrok-free.dev'
+    'thread-sedative-tinker.ngrok-free.dev',
+    'eazyshop.cfd',
+    '.eazyshop.cfd',
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -46,12 +48,23 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://django-react-ecommerce-platform.vercel.app",
     "https://eazyshop-store.vercel.app",
+    "https://eazyshop.cfd",
+    "https://www.eazyshop.cfd",
+    "http://eazyshop.cfd",
+    "http://www.eazyshop.cfd",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://django-react-ecommerce-platform.vercel.app",
     "https://eazyshop-store.vercel.app",
+    "https://eazyshop.cfd",
+    "https://www.eazyshop.cfd",
+    "http://eazyshop.cfd",
+    "http://www.eazyshop.cfd",
 ]
+
+FRONTEND_URL = config('FRONTEND_URL', default='https://eazyshop.cfd')
+
 # 🚀 Cross-Domain Cookie Security Flags (MANDATORY FOR VERCEL + RENDER)
 SESSION_COOKIE_SAMESITE = 'None'
 SESSION_COOKIE_SECURE = True
@@ -231,4 +244,4 @@ STORAGES = {
 # Razorpay Payment Gateway Settings
 RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID')
 RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
-RAZORPAY_WEBHOOK_SECRET=config('RAZORPAY_WEBHOOK_SECRET')
+RAZORPAY_WEBHOOK_SECRET = config('RAZORPAY_WEBHOOK_SECRET')
