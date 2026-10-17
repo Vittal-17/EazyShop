@@ -25,6 +25,7 @@ frontend/src/pages/.test.jsx
 # Environment Variables
 .env
 .env.*
+!.env.example
 
 # ==========================
 # React / Node
