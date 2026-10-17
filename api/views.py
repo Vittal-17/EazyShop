@@ -718,17 +718,38 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({"success": False, "message": str(e)}, status=400)
 
 
-
-class OrderItemViewSet(viewsets.ModelViewSet):
-    queryset = OrderItem.objects.select_related('order', 'product').all()
+class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
+    # ⚡ Bolt: Include 'order__user' to eliminate N+1 queries when OrderItemSerializer reads order.user.username
+    queryset = OrderItem.objects.select_related('order', 'order__user', 'product').all()
     serializer_class = OrderItemSerializer
+    # 🛡️ Sentinel: Enforce authentication to prevent Broken Object-Level Authorization (BOLA/IDOR)
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return OrderItem.objects.none()
+
         queryset = super().get_queryset()
+
+        # Admin / staff / superuser: full platform visibility
+        if getattr(user, 'role', '') == 'admin' or user.is_staff or user.is_superuser:
+            pass
+        # Vendor: visible if they sold the item or if they are the buyer
+        elif getattr(user, 'role', '') == 'seller':
+            queryset = queryset.filter(Q(order__user=user) | Q(vendor=user)).distinct()
+        # Customer: strictly limited to items in orders they placed
+        else:
+            queryset = queryset.filter(order__user=user)
+
         order_id = self.request.query_params.get('order')
         if order_id:
-            queryset = queryset.filter(order_id=order_id)
-        return queryset
+            if order_id.isdigit() and len(order_id) <= 12:
+                queryset = queryset.filter(order_id=int(order_id))
+            else:
+                return OrderItem.objects.none()
+
+        return queryset.order_by('-id')
 
 
 class CartViewSet(viewsets.ModelViewSet):

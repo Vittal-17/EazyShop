@@ -1,33 +1,8 @@
 # tests.py
 import json
 from decimal import Decimal
-from unittest.mock import patch, MagicMock
 from io import BytesIO
-
-from django.core.cache import cache
-from django.core.files.uploadedfile import SimpleUploadedFile
-from rest_framework import status
-from rest_framework.test import APITestCase
-import razorpay
-
-from .models import (
-    Address,
-    AdminLog,
-    Cart,
-    CartItem,
-    Category,
-    Order,
-    OrderItem,
-    Payment,
-    Product,
-                    )
-
-
-# tests.py
-import json
-from decimal import Decimal
-from unittest.mock import patch, MagicMock
-from io import BytesIO
+from unittest.mock import MagicMock, patch
 
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -794,3 +769,97 @@ class EazyShopTitaniumTestSuite(APITestCase):
 
         # IDOR Patch prevents access
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ==========================================
+    # PHASE 18: ORDER ITEMS SECURITY & PERFORMANCE
+    # ==========================================
+    def test_68_order_items_unauthenticated_rejected(self):
+        response = self.client.get('/api/order-items/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_69_order_items_customer_idor_isolation(self):
+        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='completed')
+        item_cust = OrderItem.objects.create(order=order_cust, product=self.product, quantity=1, price=1000, vendor=self.seller)
+
+        order_hack = Order.objects.create(user=self.hacker, total_price=50, status='completed')
+        item_hack = OrderItem.objects.create(order=order_hack, product=self.product_two, quantity=1, price=50, vendor=self.seller)
+
+        self.client.force_authenticate(user=self.customer)
+        response = self.client.get('/api/order-items/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        item_ids = [item['id'] for item in response.data]
+        self.assertIn(item_cust.id, item_ids)
+        self.assertNotIn(item_hack.id, item_ids)
+
+        # IDOR prevention on filtered order query
+        response_filtered = self.client.get(f'/api/order-items/?order={order_hack.id}')
+        self.assertEqual(response_filtered.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_filtered.data), 0)
+
+    def test_70_order_items_vendor_sees_sold_items(self):
+        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='completed')
+        item_cust = OrderItem.objects.create(order=order_cust, product=self.product, quantity=1, price=1000, vendor=self.seller)
+
+        self.client.force_authenticate(user=self.seller)
+        response = self.client.get('/api/order-items/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        item_ids = [item['id'] for item in response.data]
+        self.assertIn(item_cust.id, item_ids)
+
+    def test_71_order_items_admin_sees_all(self):
+        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='completed')
+        item_cust = OrderItem.objects.create(order=order_cust, product=self.product, quantity=1, price=1000, vendor=self.seller)
+
+        order_hack = Order.objects.create(user=self.hacker, total_price=50, status='completed')
+        item_hack = OrderItem.objects.create(order=order_hack, product=self.product_two, quantity=1, price=50, vendor=self.seller)
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get('/api/order-items/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        item_ids = [item['id'] for item in response.data]
+        self.assertIn(item_cust.id, item_ids)
+        self.assertIn(item_hack.id, item_ids)
+
+    def test_72_order_items_direct_retrieve_idor_returns_404(self):
+        order_hack = Order.objects.create(user=self.hacker, total_price=50, status='completed')
+        item_hack = OrderItem.objects.create(order=order_hack, product=self.product_two, quantity=1, price=50, vendor=self.seller)
+
+        self.client.force_authenticate(user=self.customer)
+        response = self.client.get(f'/api/order-items/{item_hack.id}/')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_73_order_items_mutations_blocked_as_read_only(self):
+        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='completed')
+        item_cust = OrderItem.objects.create(order=order_cust, product=self.product, quantity=1, price=1000, vendor=self.seller)
+
+        self.client.force_authenticate(user=self.customer)
+
+        # 1. Attacker tries to inject forged order item via POST
+        res_post = self.client.post('/api/order-items/', {"order": order_cust.id, "product": self.product.id, "quantity": 1, "price": 10}, format='json')
+        self.assertEqual(res_post.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+        # 2. Attacker tries to alter item status to 'delivered' via PATCH
+        res_patch = self.client.patch(f'/api/order-items/{item_cust.id}/', {"status": "delivered"}, format='json')
+        self.assertEqual(res_patch.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+        # 3. Attacker tries to delete order item via DELETE
+        res_delete = self.client.delete(f'/api/order-items/{item_cust.id}/')
+        self.assertEqual(res_delete.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_74_order_items_invalid_query_param_does_not_crash(self):
+        self.client.force_authenticate(user=self.customer)
+        response_null = self.client.get('/api/order-items/?order=null')
+        self.assertEqual(response_null.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_null.data), 0)
+
+        response_undefined = self.client.get('/api/order-items/?order=undefined')
+        self.assertEqual(response_undefined.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_undefined.data), 0)
+
+        # Huge integer overflow test
+        response_overflow = self.client.get('/api/order-items/?order=999999999999999999999999999999999999999999')
+        self.assertEqual(response_overflow.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response_overflow.data), 0)
