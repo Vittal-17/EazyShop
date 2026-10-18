@@ -562,6 +562,81 @@ class EazyShopTitaniumTestSuite(APITestCase):
         # Django clears cookies by setting their value to empty and expiring them
         self.assertEqual(response.cookies['refresh_token'].value, '')
 
+    def test_57a_login_returns_tokens_in_body(self):
+        response = self.client.post('/api/token/', {"email": "cust@test.com", "password": "password123"}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        self.assertTrue(len(response.data['access']) > 20)
+
+    def test_57b_cookie_dynamic_samesite_detection(self):
+        # 1. Same-site origin (eazyshop.cfd) receives Lax cookies
+        res_lax = self.client.post(
+            '/api/token/',
+            {"email": "cust@test.com", "password": "password123"},
+            format='json',
+            HTTP_ORIGIN='https://eazyshop.cfd'
+        )
+        self.assertEqual(res_lax.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_lax.cookies['access_token']['samesite'], 'Lax')
+
+        # 2. Cross-site origin (e.g. vercel.app) receives None cookies
+        res_none = self.client.post(
+            '/api/token/',
+            {"email": "cust@test.com", "password": "password123"},
+            format='json',
+            HTTP_ORIGIN='https://django-react-ecommerce-platform.vercel.app'
+        )
+        self.assertEqual(res_none.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_none.cookies['access_token']['samesite'], 'None')
+
+    def test_57c_dual_auth_bearer_token_fallback(self):
+        # Obtain tokens
+        res = self.client.post('/api/token/', {"email": "cust@test.com", "password": "password123"}, format='json')
+        access_token = res.data['access']
+
+        # Clear cookies to simulate browser blocking 3rd-party cookies
+        self.client.cookies.clear()
+
+        # Access protected endpoint with Bearer header fallback
+        profile_res = self.client.get(
+            f'/api/users/{self.customer.id}/',
+            HTTP_AUTHORIZATION=f'Bearer {access_token}'
+        )
+        self.assertEqual(profile_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_res.data['email'], 'cust@test.com')
+
+    def test_57d_cookie_auth_primary(self):
+        # Obtain tokens with cookies attached
+        self.client.post('/api/token/', {"email": "cust@test.com", "password": "password123"}, format='json')
+
+        # Access protected endpoint using cookie without Authorization header
+        profile_res = self.client.get(f'/api/users/{self.customer.id}/')
+        self.assertEqual(profile_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_res.data['email'], 'cust@test.com')
+
+    def test_57e_empty_cookie_does_not_break_public_endpoints(self):
+        # Empty cookie (e.g. from logout) should not crash authentication on public endpoints
+        self.client.cookies['access_token'] = ''
+        res = self.client.get('/api/products/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_57f_expired_cookie_falls_back_to_valid_bearer_header(self):
+        # Obtain fresh valid access token
+        res = self.client.post('/api/token/', {"email": "cust@test.com", "password": "password123"}, format='json')
+        access_token = res.data['access']
+
+        # Inject an invalid/expired cookie into the client
+        self.client.cookies['access_token'] = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.invalid.expired'
+
+        # When client sends both an expired cookie and a valid Bearer header, it should fall back and succeed
+        profile_res = self.client.get(
+            f'/api/users/{self.customer.id}/',
+            HTTP_AUTHORIZATION=f'Bearer {access_token}'
+        )
+        self.assertEqual(profile_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_res.data['email'], 'cust@test.com')
+
     # ==========================================
     # PHASE 15: FORGOT PASSWORD & OTP EDGE CASES
     # ==========================================

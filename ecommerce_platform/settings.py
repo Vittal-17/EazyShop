@@ -50,8 +50,10 @@ CORS_ALLOWED_ORIGINS = [
     "https://eazyshop-store.vercel.app",
     "https://eazyshop.cfd",
     "https://www.eazyshop.cfd",
+    "https://api.eazyshop.cfd",
     "http://eazyshop.cfd",
     "http://www.eazyshop.cfd",
+    "http://api.eazyshop.cfd",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
@@ -59,17 +61,19 @@ CSRF_TRUSTED_ORIGINS = [
     "https://eazyshop-store.vercel.app",
     "https://eazyshop.cfd",
     "https://www.eazyshop.cfd",
+    "https://api.eazyshop.cfd",
     "http://eazyshop.cfd",
     "http://www.eazyshop.cfd",
+    "http://api.eazyshop.cfd",
 ]
 
 FRONTEND_URL = config('FRONTEND_URL', default='https://eazyshop.cfd')
 
-# 🚀 Cross-Domain Cookie Security Flags (MANDATORY FOR VERCEL + RENDER)
-SESSION_COOKIE_SAMESITE = 'None'
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SAMESITE = 'None'
-CSRF_COOKIE_SECURE = True
+# 🚀 Cookie Security Defaults (Configurable via environment variables)
+SESSION_COOKIE_SAMESITE = config('SESSION_COOKIE_SAMESITE', default='Lax')
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
+CSRF_COOKIE_SAMESITE = config('CSRF_COOKIE_SAMESITE', default='Lax')
+CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
 
 # Application definition
 

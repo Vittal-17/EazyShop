@@ -30,11 +30,27 @@ export const AuthProvider = ({ children }) => {
 
   const navigate = useNavigate();
 
-  // 1. CREATE AXIOS INSTANCE WITH COOKIE CREDENTIALS
+  // 1. CREATE AXIOS INSTANCE WITH COOKIE CREDENTIALS & BEARER FALLBACK
   const axiosInstance = useMemo(() => {
     const instance = axios.create({
       baseURL: API_URL,
       withCredentials: true, // 🚀 Automatically attaches HTTP-Only cookies
+    });
+
+    // Request Interceptor: Attach Bearer token as fallback for environments blocking cross-site cookies
+    instance.interceptors.request.use((config) => {
+      const token = localStorage.getItem('access_token');
+      if (token) {
+        if (!config.headers) {
+          config.headers = {};
+        }
+        if (typeof config.headers.set === 'function') {
+          config.headers.set('Authorization', `Bearer ${token}`);
+        } else {
+          config.headers.Authorization = `Bearer ${token}`;
+        }
+      }
+      return config;
     });
 
     // Response Interceptor for 401 Silent Refresh & Session Expiration
@@ -58,12 +74,21 @@ export const AuthProvider = ({ children }) => {
           isRefreshing = true;
 
           try {
-            await instance.post('/api/token/refresh/');
+            const storedRefresh = localStorage.getItem('refresh_token');
+            const payload = storedRefresh ? { refresh: storedRefresh } : {};
+            const refreshRes = await instance.post('/api/token/refresh/', payload);
+
+            if (refreshRes.data?.access) {
+              localStorage.setItem('access_token', refreshRes.data.access);
+            }
+
             processQueue(null);
             return instance(originalRequest);
           } catch (refreshErr) {
             processQueue(refreshErr, null);
             localStorage.removeItem('user');
+            localStorage.removeItem('access_token');
+            localStorage.removeItem('refresh_token');
             setUser(null);
 
             toast.error('⏳ Session Expired, Please Log in Again', {
@@ -121,6 +146,8 @@ export const AuthProvider = ({ children }) => {
         } catch (error) {
           console.error('Session initialization error:', error);
           localStorage.removeItem('user');
+          localStorage.removeItem('access_token');
+          localStorage.removeItem('refresh_token');
           setUser(null);
         }
       }
@@ -140,7 +167,14 @@ export const AuthProvider = ({ children }) => {
       );
 
       if (res.status === 200) {
-        const { user: userData } = res.data;
+        const { user: userData, access, refresh } = res.data;
+
+        if (access) {
+          localStorage.setItem('access_token', access);
+        }
+        if (refresh) {
+          localStorage.setItem('refresh_token', refresh);
+        }
 
         localStorage.setItem('user', JSON.stringify(userData));
         setUser(userData);
@@ -212,6 +246,8 @@ export const AuthProvider = ({ children }) => {
     } finally {
       setUser(null);
       localStorage.removeItem('user');
+      localStorage.removeItem('access_token');
+      localStorage.removeItem('refresh_token');
       navigate('/login');
     }
   };

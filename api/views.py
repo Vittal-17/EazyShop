@@ -247,6 +247,41 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = []
 
 
+def get_cookie_security_flags(request):
+    """
+    Dynamically determines cookie SameSite and Secure flags:
+    - SameSite='Lax' when request originates from or targets eazyshop.cfd (same-site context),
+      or when in local development (DEBUG=True).
+    - SameSite='None' when in cross-site production environments (e.g. *.vercel.app -> *.onrender.com).
+    - Secure=True in production, or whenever SameSite='None'.
+    """
+    origin = request.headers.get('Origin') or request.META.get('HTTP_ORIGIN', '')
+    referer = request.headers.get('Referer') or request.META.get('HTTP_REFERER', '')
+    host = request.get_host().lower()
+
+    def _matches_eazyshop(target):
+        if not target:
+            return False
+        clean_host = target.split("://")[-1].split("/")[0].split(":")[0].lower()
+        return clean_host == "eazyshop.cfd" or clean_host.endswith(".eazyshop.cfd")
+
+    is_same_site = (
+        _matches_eazyshop(origin) or
+        _matches_eazyshop(referer) or
+        _matches_eazyshop(host)
+    )
+
+    if is_same_site or settings.DEBUG:
+        samesite = 'Lax'
+    else:
+        samesite = 'None'
+
+    is_production = not settings.DEBUG
+    secure = is_production or samesite == 'None'
+
+    return samesite, secure
+
+
 class CookieTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
@@ -256,28 +291,25 @@ class CookieTokenObtainPairView(TokenObtainPairView):
         if response.status_code == 200:
             access_token = response.data.get('access')
             refresh_token = response.data.get('refresh')
-            # 🚀 DYNAMIC SECURITY: Uses Lax/HTTP locally, and None/HTTPS in production
-            is_production = not settings.DEBUG
+            samesite_flag, secure_flag = get_cookie_security_flags(request)
 
             if access_token and refresh_token:
                 response.set_cookie(
                     key='access_token',
                     value=access_token,
                     httponly=True,
-                    secure=True,        # 🚀 FORCES HTTPS TRANSMISSION
-                    samesite='None',    # 🚀 ALLOWS CROSS-DOMAIN COOKIES
+                    secure=secure_flag,
+                    samesite=samesite_flag,
                     max_age=300
                 )
                 response.set_cookie(
                     key='refresh_token',
                     value=refresh_token,
                     httponly=True,
-                    secure=True,        # 🚀 FORCES HTTPS TRANSMISSION
-                    samesite='None',    # 🚀 ALLOWS CROSS-DOMAIN COOKIES
+                    secure=secure_flag,
+                    samesite=samesite_flag,
                     max_age=86400
                 )
-                del response.data['access']
-                del response.data['refresh']
 
         return response
 
@@ -285,26 +317,25 @@ class CookieTokenObtainPairView(TokenObtainPairView):
 class CookieTokenRefreshView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
         refresh_token = request.COOKIES.get('refresh_token')
-        if refresh_token:
+        if refresh_token and not request.data.get('refresh'):
+            if hasattr(request.data, '_mutable') and not request.data._mutable:
+                request.data._mutable = True
             request.data['refresh'] = refresh_token
 
         response = super().post(request, *args, **kwargs)
 
         if response.status_code == 200:
             access_token = response.data.get('access')
-
-            # 🚀 DYNAMIC SECURITY: Uses Lax/HTTP locally, and None/HTTPS in production
-            is_production = not settings.DEBUG
+            samesite_flag, secure_flag = get_cookie_security_flags(request)
 
             response.set_cookie(
                 key='access_token',
                 value=access_token,
                 httponly=True,
-                secure=is_production,
-                samesite='None' if is_production else 'Lax',
+                secure=secure_flag,
+                samesite=samesite_flag,
                 max_age=300
             )
-            del response.data['access']
 
         return response
 
@@ -314,10 +345,7 @@ class LogoutView(APIView):
 
     def post(self, request):
         response = Response({"success": True, "message": "Logged out successfully."})
-
-        # 🚀 DYNAMIC SECURITY: The deletion request must perfectly match the creation flags
-        is_production = not settings.DEBUG
-        samesite_flag = 'None' if is_production else 'Lax'
+        samesite_flag, _ = get_cookie_security_flags(request)
 
         response.delete_cookie('access_token', path='/', samesite=samesite_flag)
         response.delete_cookie('refresh_token', path='/', samesite=samesite_flag)
