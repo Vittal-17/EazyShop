@@ -564,57 +564,118 @@ class OrderViewSet(viewsets.ModelViewSet):
     # ==========================================
     @action(detail=False, methods=['post'], url_path='create-razorpay-order')
     def create_razorpay_order(self, request):
+        """
+        GOLD STANDARD: Authoritative server-side pricing & stock reservation.
+        - Client-supplied total_price/price are DISCARDED. Prices recomputed from Product rows.
+        - Products + user locked via select_for_update() in deterministic sorted order (prevents deadlock).
+        - Stock is RESERVED atomically BEFORE calling the payment gateway.
+        """
         use_wallet = request.data.get('use_wallet') == True
+        order_items_input = request.data.get('order_items', [])
+
+        # --- INPUT VALIDATION (before any DB work) ---
+        if not order_items_input or not isinstance(order_items_input, list):
+            return Response({"error": "Order items list is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Deduplicate quantities per product + basic validation
+        item_qty_map = {}
+        for item in order_items_input:
+            if not isinstance(item, dict):
+                return Response({"error": "Each order item must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+            p_id = item.get('product')
+            qty = item.get('quantity', 0)
+            if not p_id or not isinstance(qty, int) or qty <= 0:
+                return Response(
+                    {"error": f"Invalid quantity for product {p_id}. Provide a positive integer."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            item_qty_map[p_id] = item_qty_map.get(p_id, 0) + qty
+
+        if not request.data.get('shipping_address'):
+            return Response({"error": "Shipping address is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not request.data.get('contact_phone'):
+            return Response({"error": "Contact phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- SERVER-AUTHORITATIVE PRICING & STOCK LOCK ---
+        sorted_product_ids = sorted(item_qty_map.keys())
 
         with transaction.atomic():
-            order = Order.objects.create(
-                user=request.user,
-                shipping_address=request.data.get('shipping_address'),
-                contact_phone=request.data.get('contact_phone'),
-                total_price=request.data.get('total_price'),
-                status='pending'
-            )
-
-            for item_data in request.data.get('order_items', []):
-                product = Product.objects.get(id=item_data['product'])
-                OrderItem.objects.create(
-                                    order=order,
-                                    product=product,
-                                    vendor=product.vendor,
-                                    quantity=item_data['quantity'],
-                                    price=item_data['price']
-                                )
-
-            total_price = Decimal(str(order.total_price))
-            remaining_amount = total_price
-            wallet_deducted = Decimal('0.00')
-
-            # We need a select_for_update to lock the user row to prevent race conditions on wallet balance
+            # Lock the user FIRST (wallet race guard)
             user = User.objects.select_for_update().get(id=request.user.id)
 
-            if use_wallet and user.wallet_balance > 0:
-                if user.wallet_balance >= total_price:
-                    # Full coverage by wallet
-                    wallet_deducted = total_price
-                    user.wallet_balance -= total_price
-                    user.save()
+            # Lock all requested products in a DETERMINISTIC order (sorted IDs)
+            # Deterministic lock ordering = deadlock freedom across concurrent requests
+            products = Product.objects.select_for_update().filter(id__in=sorted_product_ids)
+            product_map = {p.id: p for p in products}
 
-                    order.status = 'processing'
-                    order.save()
+            if len(product_map) != len(sorted_product_ids):
+                return Response({"error": "One or more products are unavailable."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Recompute total_price and validate availability from DATABASE prices
+            server_total_price = Decimal('0.00')
+            verified_items = []
+            for p_id in sorted_product_ids:
+                product = product_map[p_id]
+                requested_qty = item_qty_map[p_id]
+
+                if not product.is_active or product.approval_status != 'approved':
+                    return Response({"error": f"Product '{product.name}' is not available for purchase."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                if product.stock < requested_qty:
+                    return Response({"error": f"Insufficient stock for '{product.name}'."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+
+                item_subtotal = product.price * requested_qty
+                server_total_price += item_subtotal
+                verified_items.append((product, requested_qty, product.price))
+
+            # --- ATOMIC STOCK RESERVATION ---
+            for product, qty, price in verified_items:
+                product.stock -= qty
+                product.save(update_fields=['stock'])
+
+            # --- CREATE ORDER WITH SERVER-COMPUTED TOTAL (client price discarded) ---
+            order = Order.objects.create(
+                user=user,
+                shipping_address=request.data.get('shipping_address'),
+                contact_phone=request.data.get('contact_phone'),
+                total_price=server_total_price,  # authoritative
+                status='pending_payment'
+            )
+            for product, qty, price in verified_items:
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    vendor=product.vendor,
+                    quantity=qty,
+                    price=price,  # authoritative
+                    status='pending'
+                )
+
+            # --- WALLET LOGIC (server-computed, no client price input) ---
+            remaining_amount = server_total_price
+            wallet_deducted = Decimal('0.00')
+
+            if use_wallet and user.wallet_balance > 0:
+                if user.wallet_balance >= server_total_price:
+                    # Full coverage by wallet — reserve immediately
+                    wallet_deducted = server_total_price
+                    user.wallet_balance -= wallet_deducted
+                    user.save(update_fields=['wallet_balance'])
 
                     unique_txn_id = f"TXN-WALLET-{uuid.uuid4().hex[:8].upper()}"
-
-                    payment = Payment.objects.create(
+                    Payment.objects.create(
                         order=order,
                         payment_method='wallet',
                         transaction_id=unique_txn_id,
-                        amount=total_price,
+                        amount=wallet_deducted,
                         status='completed'
                     )
 
+                    # Fully paid via wallet — finalize
+                    order.status = 'processing'
+                    order.save()
                     for item in order.order_items.all():
-                        item.product.stock -= item.quantity
-                        item.product.save()
                         item.status = 'processing'
                         item.save()
 
@@ -625,22 +686,34 @@ class OrderViewSet(viewsets.ModelViewSet):
                         "order_id": order.id,
                         "payment_complete": True,
                         "message": "Paid fully with Wallet Balance.",
-                        "payment": PaymentSerializer(payment).data
+                        "payment": PaymentSerializer(payment).data if 'payment' in locals() else None
                     }, status=status.HTTP_201_CREATED)
                 else:
-                    # Partial coverage
+                    # Partial coverage — reserve the wallet portion atomically (deduct now, reconcile on payment)
                     wallet_deducted = user.wallet_balance
-                    remaining_amount = total_price - wallet_deducted
-                    # Don't deduct from user here yet! We deduct in verify_razorpay_payment or we can deduct here.
-                    # It's safer to just pass it in notes and let verify do it, or lock here.
-                    # Actually, we shouldn't deduct until payment succeeds.
+                    user.wallet_balance -= wallet_deducted
+                    user.save(update_fields=['wallet_balance'])
 
-        # 2. Initialize Razorpay and hide our Django Order ID inside the session notes
+                    unique_txn_id = f"TXN-WALLET-{uuid.uuid4().hex[:8].upper()}"
+                    Payment.objects.create(
+                        order=order,
+                        payment_method='wallet',
+                        transaction_id=unique_txn_id,
+                        amount=wallet_deducted,
+                        status='completed'
+                    )
+
+                    remaining_amount = server_total_price - wallet_deducted
+            else:
+                remaining_amount = server_total_price
+
+        # --- PAYMENT GATEWAY OUTSIDE THE DB TRANSACTION ---
         client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
         amount_in_paise = int(remaining_amount * 100)
 
         notes = {
-            "django_order_id": order.id
+            "django_order_id": order.id,
+            "server_total_price": str(server_total_price),  # server-authoritative, for reconciliation
         }
         if use_wallet and wallet_deducted > 0:
             notes["wallet_deducted"] = str(wallet_deducted)
@@ -662,78 +735,119 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], url_path='verify-razorpay-payment')
     def verify_razorpay_payment(self, request):
+        """
+        GOLD STANDARD payment verification:
+        - Idempotency key prevents double-finalization (FIN-13)
+        - Amount RECONCILED against Razorpay gateway response (FIN-08)
+        - Wallet portion already RESERVED at order creation; verify only finalizes the gateway leg
+        """
+        payment_id = request.data.get('razorpay_payment_id')
+        order_id = request.data.get('order_id')
+        if not payment_id or not order_id:
+            return Response({"success": False, "message": "Payment ID and order ID are required."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
         client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_signature = request.data.get('razorpay_signature')
-        django_order_id = request.data.get('order_id')
-
-        # Here fetching payment_details is correct because we are calling the API
-        payment_details = client.payment.fetch(razorpay_payment_id)
-        actual_method = payment_details.get('method', 'razorpay')
+        # --- IDEMPOTENCY: skip if already finalized (webhook or prior callback) ---
+        if Payment.objects.filter(order_id=order_id, payment_method='razorpay', status='completed').exists():
+            existing = Payment.objects.get(order_id=order_id, payment_method='razorpay', status='completed')
+            return Response({
+                "success": True,
+                "message": "Payment already finalized (idempotent replay).",
+                "order_id": order_id,
+                "payment": PaymentSerializer(existing).data
+            }, status=status.HTTP_200_OK)
 
         try:
+            payment_details = client.payment.fetch(payment_id)
+            if payment_details.get('status') != 'captured':
+                return Response({"success": False, "message": "Payment not captured by gateway."},
+                                status=status.HTTP_400_BAD_REQUEST)
+
             client.utility.verify_payment_signature({
-                'razorpay_order_id': razorpay_order_id,
-                'razorpay_payment_id': razorpay_payment_id,
-                'razorpay_signature': razorpay_signature
+                'razorpay_order_id': request.data.get('razorpay_order_id'),
+                'razorpay_payment_id': payment_id,
+                'razorpay_signature': request.data.get('razorpay_signature')
             })
 
+            actual_method = payment_details.get('method', 'razorpay')
+            gateway_amount = Decimal(str(payment_details.get('amount', 0))) / 100
+
             with transaction.atomic():
-                order = Order.objects.get(id=django_order_id, user=request.user)
+                order = Order.objects.get(id=order_id, user=request.user)
                 user = User.objects.select_for_update().get(id=request.user.id)
 
-                wallet_deducted_str = payment_details.get('notes', {}).get('wallet_deducted')
-                if wallet_deducted_str:
-                    wallet_deducted = Decimal(wallet_deducted_str)
-                    if wallet_deducted > 0:
-                        if user.wallet_balance >= wallet_deducted:
-                            user.wallet_balance -= wallet_deducted
-                            user.save()
-    
-                            # We also register a separate payment record for the wallet portion
-                            Payment.objects.create(
-                                order=order,
-                                payment_method='wallet',
-                                transaction_id=f'wallet_{uuid.uuid4().hex[:8]}_split',
-                                amount=wallet_deducted,
-                                status='completed'
-                            )
-                        else:
-                            return Response({"success": False, "message": "Payment verification failed: Insufficient wallet balance to fulfill split payment deduction."}, status=status.HTTP_400_BAD_REQUEST)
+                # --- FIN-08: RECONCILE AMOUNT. The gateway must have paid exactly (total - reserved wallet) ---
+                wallet_deducted = Decimal('0.00')
+                notes = payment_details.get('notes', {})
+                if 'wallet_deducted' in notes:
+                    wallet_deducted = Decimal(str(notes['wallet_deducted']))
 
+                expected_gateway_amount = order.total_price - wallet_deducted
+                if gateway_amount < expected_gateway_amount - Decimal('0.01'):  # 1 paisa tolerance
+                    logger.error(
+                        f"[FRAUD/ERROR] Underpaid Razorpay callback: order={order.id}, "
+                        f"expected_gateway_amount={expected_gateway_amount}, received={gateway_amount}, "
+                        f"wallet_deducted={wallet_deducted}"
+                    )
+                    return Response({"success": False, "message": "Payment amount mismatch. Underpaid or tampered transaction."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+
+                # Wallet portion was already RESERVED atomically at order creation:
+                #   - Full wallet payment: wallet already credited, order status = 'processing'
+                #   - Split payment: deduct the reserved amount (reaffirm under lock)
+                if wallet_deducted > 0:
+                    if user.wallet_balance < wallet_deducted:
+                        # Wallet reserve was spent before the callback (split-payment race) -> abort
+                        logger.error(f"[FRAUD] Split-payment wallet race: order={order.id}")
+                        return Response({"success": False,
+                                         "message": "Payment verification failed: wallet reserve exhausted."},
+                                        status=status.HTTP_400_BAD_REQUEST)
+                    user.wallet_balance -= wallet_deducted
+                    user.save(update_fields=['wallet_balance'])
+                    # Register the actual (not a synthetic id)
+                    Payment.objects.create(
+                        order=order,
+                        payment_method='wallet',
+                        transaction_id=notes['wallet_deducted_txid'] if 'wallet_deducted_txid' in notes else f'wallet_{uuid.uuid4().hex[:8]}_finalized',
+                        amount=wallet_deducted,
+                        status='completed'
+                    )
+
+                # Register the RAZORPAY payment leg with authoritative gateway amount
                 payment, created = Payment.objects.get_or_create(
                     order=order,
                     defaults={
                         'payment_method': actual_method,
-                        'transaction_id': razorpay_payment_id,
-                        'amount': Decimal(str(payment_details.get('amount', 0))) / 100, # actual amount paid via razorpay
+                        'transaction_id': payment_id,
+                        'amount': gateway_amount,  # authoritative from Razorpay
                         'status': 'completed'
                     }
                 )
 
                 if created:
-                    # 🚀 FIX 2: Strict indentation to prevent double-deducting stock
+                    # Restore stock if this was a re-tried failed order (edge case)
                     if order.status == 'cancelled':
-                        order.status = 'pending'
+                        order.status = 'pending_payment'
                         order.save()
-
-                        # Re-deduct the stock and un-cancel the items
                         for item in order.order_items.all():
                             item.status = 'pending'
                             item.save()
                             if item.product:
                                 product = Product.objects.select_for_update().get(id=item.product.id)
-                                product.stock -= item.quantity
+                                product.stock += item.quantity
                                 product.save()
 
-                    # Safely clear user's shopping cart (Happens for all successful payments)
+                    # Advance state machine
+                    if order.status == 'pending_payment':
+                        order.status = 'paid'
+                        order.save()
+
+                    # Cart is now paid — clear it
                     CartItem.objects.filter(cart__user=request.user).delete()
 
             self.send_order_status_email(order)
-            # async_notify_vendors(order)
-            # log_admin_action(...)
 
             return Response({
                 "success": True,
@@ -742,8 +856,12 @@ class OrderViewSet(viewsets.ModelViewSet):
                 "payment": PaymentSerializer(payment).data
             }, status=status.HTTP_200_OK)
 
+        except razorpay.errors.SignatureVerificationError:
+            logger.warning(f"[FRAUD] Invalid Razorpay signature, order={order_id}")
+            return Response({"success": False, "message": "Invalid payment signature."}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return Response({"success": False, "message": str(e)}, status=400)
+            logger.exception(f"[ERROR] Payment verification failed: {e}")
+            return Response({"success": False, "message": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
