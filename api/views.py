@@ -558,7 +558,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     def cancel(self, request, pk=None):
         order = self.get_object()
 
-        if order.status != 'pending':
+        if order.status not in ['pending', 'pending_payment']:
             return Response({"error": "Cannot cancel non-pending order."}, status=status.HTTP_400_BAD_REQUEST)
 
         with transaction.atomic():
