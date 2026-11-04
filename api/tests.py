@@ -76,6 +76,56 @@ class EazyShopTitaniumTestSuite(APITestCase):
         response = self.client.patch(self.user_detail_url, {"role": "admin"}, format='multipart')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_04b_user_cannot_delete_other_accounts(self):
+        """Any customer DELETE on any other account (incl. admin) is blocked."""
+        self.client.force_authenticate(user=self.customer)
+        res_admin = self.client.delete(f'/api/users/{self.admin.id}/')
+        res_hacker = self.client.delete(f'/api/users/{self.hacker.id}/')
+        self.assertEqual(res_admin.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res_hacker.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_04c_customer_cannot_delete_self(self):
+        """Customers (any non-admin role) cannot delete themselves or anyone."""
+        self.client.force_authenticate(user=self.customer)
+        res_self = self.client.delete(self.user_detail_url)
+        res_admin = self.client.delete(f'/api/users/{self.admin.id}/')
+        self.assertEqual(res_self.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res_admin.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_04d_admin_can_delete_regular_user(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(f'/api/users/{self.customer.id}/')
+        self.assertIn(res.status_code, [status.HTTP_204_NO_CONTENT, status.HTTP_200_OK])
+
+    def test_04e_admin_cannot_delete_last_admin(self):
+        # self.admin is the sole administrator in this suite. Any attempt to remove the
+        # last admin account (including self-deletion of the sole admin) is blocked.
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(f'/api/users/{self.admin.id}/')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('last administrator', res.data['error'])
+
+    def test_04f_admin_can_delete_others_while_they_remain(self):
+        # Admins may delete non-admin accounts freely; they may also delete OTHER
+        # admin accounts as long as a surviving admin remains afterwards.
+        admin2 = User.objects.create_user(username="admin2", email="admin2@test.com",
+                                          password="password123", role="admin", is_staff=True)
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(f'/api/users/{admin2.id}/')
+        self.assertIn(res.status_code, [status.HTTP_204_NO_CONTENT, status.HTTP_200_OK])
+
+    def test_04g_second_admin_cannot_delete_last_admin(self):
+        # admin2 deletes self.admin -> allowed (admin2 remains). Then admin2 deletes
+        # ITSELF -> blocked: that would be the last admin account.
+        admin2 = User.objects.create_user(username="admin2", email="admin2@test.com",
+                                          password="password123", role="admin", is_staff=True)
+        self.client.force_authenticate(user=self.admin)
+        self.client.delete(f'/api/users/{admin2.id}/')  # admin2 deleted by self.admin
+        # Now self.admin is the sole admin again; deleting self would trigger the guard:
+        res = self.client.delete(f'/api/users/{self.admin.id}/')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('last administrator', res.data['error'])
+
     def test_05_unauthenticated_access_rejected(self):
         response = self.client.get(self.order_url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

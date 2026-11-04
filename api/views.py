@@ -73,6 +73,7 @@ from .permissions import (
     IsAdminOrOwner,
     IsAdminUser,
     IsOwnerOrReadOnly,
+    IsProductOwnerOrAdmin,
     IsSellerAdminOrReadOnly,
     IsSellerOrAdmin,
 )
@@ -122,6 +123,27 @@ class UserViewSet(viewsets.ModelViewSet):
     lookup_field = 'id'
     pagination_class = StandardResultsSetPagination
     parser_classes = [MultiPartParser, FormParser]
+
+    # ==========================================
+    # SEC-01: Object-level authorization — destroy() enforces admin-only deletion.
+    # CRITICAL INVARIANT: an admin account must always exist (admin panel auth).
+    # An admin may delete any non-admin user freely, but may NEVER reduce the total
+    # count of admin/staff/superuser accounts to zero — this covers both
+    # "other-admin deletion leaving none" and "the last admin self-deletion".
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        is_admin = getattr(request.user, 'role', None) == 'admin' or request.user.is_staff or request.user.is_superuser
+        if not is_admin:
+            return Response({"error": "Account deletion requires administrator privileges."},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        remaining_after = User.objects.filter(
+            Q(role='admin') | Q(is_staff=True) | Q(is_superuser=True)
+        ).exclude(id=instance.id).count()
+        if remaining_after == 0:
+            return Response({"error": "Cannot delete the last administrator account — at least one admin must remain for admin panel access."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return super().destroy(request, *args, **kwargs)
 
 
     def get_serializer_class(self):
@@ -380,7 +402,8 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsSellerAdminOrReadOnly]
+    # SEC-02: object-level permission enforced on every mutation
+    permission_classes = [IsProductOwnerOrAdmin]
     pagination_class = StandardResultsSetPagination
 
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
