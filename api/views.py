@@ -54,6 +54,9 @@ from rest_framework.permissions import (
 )
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
+from django.middleware.csrf import get_token, rotate_token
+from .authenticate import enforce_csrf
 
 from .email_service import (
     async_notify_cancellation,
@@ -349,45 +352,33 @@ class AddressViewSet(viewsets.ModelViewSet):
 
 
 class RegisterView(generics.CreateAPIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     queryset = User.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = []
     throttle_classes = [AuthRateThrottle]
 
 
-def get_cookie_security_flags(request):
-    """
-    Dynamically determines cookie SameSite and Secure flags:
-    - SameSite='Lax' when request originates from or targets eazyshop.cfd (same-site context),
-      or when in local development (DEBUG=True).
-    - SameSite='None' when in cross-site production environments (e.g. *.vercel.app -> *.onrender.com).
-    - Secure=True in production, or whenever SameSite='None'.
-    """
-    origin = request.headers.get('Origin') or request.META.get('HTTP_ORIGIN', '')
-    referer = request.headers.get('Referer') or request.META.get('HTTP_REFERER', '')
-    host = request.get_host().lower()
+def set_auth_cookies(response, tokens):
+    for name, lifetime in (('access', 'ACCESS_TOKEN_LIFETIME'), ('refresh', 'REFRESH_TOKEN_LIFETIME')):
+        token = tokens.get(name)
+        if token:
+            response.set_cookie(
+                f'{name}_token', token, httponly=True,
+                secure=settings.AUTH_COOKIE_SECURE, samesite=settings.AUTH_COOKIE_SAMESITE,
+                path='/', max_age=int(settings.SIMPLE_JWT[lifetime].total_seconds()),
+            )
+    response['Cache-Control'] = 'no-store'
 
-    def _matches_eazyshop(target):
-        if not target:
-            return False
-        clean_host = target.split("://")[-1].split("/")[0].split(":")[0].lower()
-        return clean_host == "eazyshop.cfd" or clean_host.endswith(".eazyshop.cfd")
 
-    is_same_site = (
-        _matches_eazyshop(origin) or
-        _matches_eazyshop(referer) or
-        _matches_eazyshop(host)
-    )
+class CSRFTokenView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
-    if is_same_site or settings.DEBUG:
-        samesite = 'Lax'
-    else:
-        samesite = 'None'
-
-    is_production = not settings.DEBUG
-    secure = is_production or samesite == 'None'
-
-    return samesite, secure
+    def get(self, request):
+        response = Response({'csrfToken': get_token(request)})
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 class CookieTokenObtainPairView(TokenObtainPairView):
@@ -395,98 +386,53 @@ class CookieTokenObtainPairView(TokenObtainPairView):
     throttle_classes = [AuthRateThrottle]
 
     def post(self, request, *args, **kwargs):
+        enforce_csrf(request)
         response = super().post(request, *args, **kwargs)
-
-        if response.status_code == 200:
-            access_token = response.data.get('access')
-            refresh_token = response.data.get('refresh')
-            samesite_flag, secure_flag = get_cookie_security_flags(request)
-
-            if access_token and refresh_token:
-                response.set_cookie(
-                    key='access_token',
-                    value=access_token,
-                    httponly=True,
-                    secure=secure_flag,
-                    samesite=samesite_flag,
-                    max_age=300
-                )
-                response.set_cookie(
-                    key='refresh_token',
-                    value=refresh_token,
-                    httponly=True,
-                    secure=secure_flag,
-                    samesite=samesite_flag,
-                    max_age=86400
-                )
-
-                # SEC-08: Strip raw tokens from JSON body to prevent XSS leakage
-                response.data.pop('access', None)
-                response.data.pop('refresh', None)
-
+        tokens = {name: response.data.pop(name, None) for name in ('access', 'refresh')}
+        set_auth_cookies(response, tokens)
+        rotate_token(request)
+        response.data['csrfToken'] = get_token(request)
         return response
 
 
 class CookieTokenRefreshView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
-        refresh_token = request.COOKIES.get('refresh_token')
-        if refresh_token and not request.data.get('refresh'):
-            if hasattr(request.data, '_mutable') and not request.data._mutable:
-                request.data._mutable = True
-            request.data['refresh'] = refresh_token
-
-        response = super().post(request, *args, **kwargs)
-
-        if response.status_code == 200:
-            access_token = response.data.get('access')
-            new_refresh = response.data.get('refresh')
-            samesite_flag, secure_flag = get_cookie_security_flags(request)
-
-            response.set_cookie(
-                key='access_token',
-                value=access_token,
-                httponly=True,
-                secure=secure_flag,
-                samesite=samesite_flag,
-                max_age=300
-            )
-            if new_refresh:
-                response.set_cookie(
-                    key='refresh_token',
-                    value=new_refresh,
-                    httponly=True,
-                    secure=secure_flag,
-                    samesite=samesite_flag,
-                    max_age=86400
-                )
-
-            # SEC-08: Strip raw tokens from JSON body to prevent XSS leakage
-            response.data.pop('access', None)
-            response.data.pop('refresh', None)
-            response.data['detail'] = "Token refreshed successfully."
-
+        enforce_csrf(request)
+        # Cookie wins over a body token, so a supplied body cannot switch the session.
+        token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
+        if not token:
+            raise InvalidToken('Refresh credential is missing.')
+        serializer = self.get_serializer(data={'refresh': token})
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as exc:
+            raise InvalidToken(str(exc)) from exc
+        response = Response({'detail': 'Token refreshed successfully.', 'csrfToken': get_token(request)})
+        set_auth_cookies(response, serializer.validated_data)
         return response
 
 
 class LogoutView(APIView):
+    authentication_classes = []  # Logout must work even with expired access cookies.
     permission_classes = [AllowAny]
 
     def post(self, request):
-        response = Response({"success": True, "message": "Logged out successfully."})
-        samesite_flag, _ = get_cookie_security_flags(request)
-
-        # SEC-12 / Blocker 9: Server-side JWT refresh token blacklisting
-        refresh_token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
-        if refresh_token:
+        enforce_csrf(request)
+        token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
+        if token:
             try:
-                token = RefreshToken(refresh_token)
-                token.blacklist()
-            except Exception as e:
-                logger.warning(f"[LOGOUT] Refresh token blacklisting skipped or failed: {e}")
-
-        response.delete_cookie('access_token', path='/', samesite=samesite_flag)
-        response.delete_cookie('refresh_token', path='/', samesite=samesite_flag)
-
+                RefreshToken(token).blacklist()
+            except TokenError:
+                pass  # Already expired or revoked is a successful logout.
+            except Exception:
+                logger.exception('Logout revocation failed')
+                return Response({'detail': 'Logout failed. Please retry.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        response = Response({'success': True, 'message': 'Logged out successfully.'})
+        for name in ('access_token', 'refresh_token'):
+            response.delete_cookie(name, path='/', samesite=settings.AUTH_COOKIE_SAMESITE)
+            response.cookies[name]['secure'] = settings.AUTH_COOKIE_SECURE
+            response.cookies[name]['httponly'] = True
+        response['Cache-Control'] = 'no-store'
         return response
 
 # ==========================================
@@ -1046,39 +992,49 @@ class OrderViewSet(
 
     @action(detail=False, methods=['post'], url_path='verify-razorpay-payment')
     def verify_razorpay_payment(self, request):
-        """
-        GOLD STANDARD payment verification:
-        - Idempotency key prevents double-finalization (FIN-13)
-        - Amount RECONCILED against Razorpay gateway response (FIN-08)
-        - Wallet portion already RESERVED at order creation; verify only finalizes the gateway leg
-        """
-        idem_key = get_idempotency_key(request)
-        if idem_key and request.user.is_authenticated:
-            cached_res, lock_acquired = check_idempotency(request.user.id, "verify_razorpay_payment", idem_key)
-            if cached_res:
-                return Response(cached_res['data'], status=cached_res['status'])
-            if not lock_acquired:
-                return Response(
-                    {"success": False, "message": "A payment verification with this idempotency key is already in progress."},
-                    status=status.HTTP_409_CONFLICT
-                )
-
-        payment_id = request.data.get('razorpay_payment_id')
+        # Authorization must precede payment queries, replay responses and provider calls.
+        if not isinstance(request.data, dict):
+            return Response({'success': False, 'message': 'Invalid verification request.'}, status=400)
         order_id = request.data.get('order_id')
-        if not payment_id or not order_id:
-            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-            return Response({"success": False, "message": "Payment ID and order ID are required."},
-                            status=status.HTTP_400_BAD_REQUEST)
+        payment_id = request.data.get('razorpay_payment_id')
+        gateway_order_id = request.data.get('razorpay_order_id')
+        invalid = {"success": False, "message": "Payment does not match this order."}
+        if (
+            isinstance(order_id, bool) or not isinstance(order_id, (str, int))
+            or len(str(order_id)) > 19 or not str(order_id).isascii() or not str(order_id).isdigit()
+            or not 0 < int(order_id) <= 9223372036854775807
+            or not isinstance(payment_id, str) or not 1 <= len(payment_id) <= 100
+            or not isinstance(gateway_order_id, str) or not 1 <= len(gateway_order_id) <= 100
+        ):
+            return Response(invalid, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            order = Order.objects.filter(pk=order_id, user=request.user).first()
-            if not order or not order.gateway_order_id or order.gateway_order_id != request.data.get('razorpay_order_id'):
-                raise ModelValidationError("Payment does not match this order.")
+            with transaction.atomic():
+                order = Order.objects.select_for_update().filter(pk=order_id, user=request.user).first()
+                if not order or not order.gateway_order_id or order.gateway_order_id != gateway_order_id:
+                    raise ModelValidationError("Payment does not match this order.")
+                payment = order.payment.filter(transaction_id=payment_id).first()
+                if payment and payment.verified_at:
+                    if payment.status != 'completed' or order.status not in Order.FULFILLABLE_STATUSES:
+                        raise ModelValidationError("Payment is no longer settled.")
+                    order.require_verified_settlement()
+                    return Response({
+                        "success": True, "message": "Payment verified successfully!",
+                        "order_id": order.id, "payment": PaymentSerializer(payment).data,
+                    })
+                if Payment.objects.filter(transaction_id=payment_id).exclude(order=order).exists():
+                    raise ModelValidationError("Payment does not match this order.")
+                if order.status not in ('pending', 'pending_payment'):
+                    raise ModelValidationError("Order no longer accepts payments.")
+
+            signature = request.data.get('razorpay_signature')
+            if not isinstance(signature, str) or not 1 <= len(signature) <= 256:
+                raise ModelValidationError("Invalid payment signature.")
             client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
             client.utility.verify_payment_signature({
                 'razorpay_order_id': order.gateway_order_id,
                 'razorpay_payment_id': payment_id,
-                'razorpay_signature': request.data.get('razorpay_signature')
+                'razorpay_signature': signature,
             })
             payment_details = client.payment.fetch(payment_id)
             if payment_details.get('id') != payment_id:
@@ -1091,30 +1047,22 @@ class OrderViewSet(
                 payment, finalized = record_gateway_capture(order, payment_details)
                 if payment.status != 'completed':
                     raise ModelValidationError("Payment is no longer settled.")
+                order.require_verified_settlement()
                 if finalized:
                     self.send_order_status_email(order)
                     transaction.on_commit(lambda: async_notify_vendors(order))
-
-            resp_data = {
-                "success": True,
-                "message": "Payment verified successfully!",
-                "order_id": order.id,
-                "payment": PaymentSerializer(payment).data
-            }
-            store_idempotency_result(request.user.id, "verify_razorpay_payment", idem_key, resp_data, status.HTTP_200_OK)
-            return Response(resp_data, status=status.HTTP_200_OK)
-
+                resp_data = {
+                    "success": True, "message": "Payment verified successfully!",
+                    "order_id": order.id, "payment": PaymentSerializer(payment).data,
+                }
+            return Response(resp_data)
         except ModelValidationError as exc:
-            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
             return Response({"success": False, "message": exc.messages[0]}, status=status.HTTP_400_BAD_REQUEST)
         except razorpay.errors.SignatureVerificationError:
-            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-            logger.warning(f"[FRAUD] Invalid Razorpay signature, order={order_id}")
             return Response({"success": False, "message": "Invalid payment signature."}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-            logger.exception(f"[ERROR] Payment verification failed: {e}")
-            return Response({"success": False, "message": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception("Payment verification failed")
+            return Response({"success": False, "message": "Payment verification failed."}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1268,7 +1216,7 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return Payment.objects.none()
-        if getattr(user, 'role', '') == 'admin' or user.is_staff or user.is_superuser:
+        if can_view_all_orders(user):
             return Payment.objects.select_related('order').all().order_by('-created_at')
         return Payment.objects.select_related('order').filter(order__user=user).order_by('-created_at')
 
@@ -1369,6 +1317,7 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
 # 6. PASSWORD RESET VIA EMAIL OTP ENDPOINTS
 # ==========================================
 class RequestPasswordResetView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
     throttle_classes = [AuthRateThrottle]
 
@@ -1394,6 +1343,7 @@ class RequestPasswordResetView(APIView):
 
 
 class VerifyOTPView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
     throttle_classes = [AuthRateThrottle]
 
@@ -1428,6 +1378,7 @@ class VerifyOTPView(APIView):
 from django.db import transaction, connection
 
 class ConfirmPasswordResetView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
     throttle_classes = [AuthRateThrottle]
 

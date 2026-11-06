@@ -1,126 +1,42 @@
 // src/context/AuthContext.js
-import { createContext, useEffect, useState, useMemo } from 'react';
-import axios from 'axios';
+import { createContext, useEffect, useState, useRef } from 'react';
+import axiosInstance from '../utils/axios';
 import toast from 'react-hot-toast';
 import { useNavigate } from 'react-router-dom';
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
 export const AuthContext = createContext();
-
-// ==========================================
-// 🚀 AXIOS REFRESH QUEUE STATE
-// ==========================================
-let isRefreshing = false;
-let failedQueue = [];
-
-const processQueue = (error, token = null) => {
-  failedQueue.forEach(prom => {
-    if (error) {
-      prom.reject(error);
-    } else {
-      prom.resolve(token);
-    }
-  });
-  failedQueue = [];
-};
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const navigate = useNavigate();
+  const sessionVersion = useRef(0);
 
-  // 1. CREATE AXIOS INSTANCE WITH COOKIE CREDENTIALS & BEARER FALLBACK
-  const axiosInstance = useMemo(() => {
-    const instance = axios.create({
-      baseURL: API_URL,
-      withCredentials: true, // 🚀 Automatically attaches HTTP-Only cookies
-      xsrfCookieName: 'csrftoken',
-      xsrfHeaderName: 'X-CSRFToken',
+  useEffect(() => {
+    // Remove credentials left by older clients. JWTs now live only in HttpOnly cookies.
+    localStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+    return axiosInstance.setSessionExpiredHandler(() => {
+      sessionVersion.current += 1;
+      setLoading(false);
+      localStorage.removeItem('user');
+      setUser(null);
+      toast.error('Session expired. Please log in again.');
+      navigate('/login');
     });
-
-    // Request Interceptor: Attach Bearer token as fallback for environments blocking cross-site cookies
-    instance.interceptors.request.use((config) => {
-      const token = localStorage.getItem('access_token');
-      if (token) {
-        if (!config.headers) {
-          config.headers = {};
-        }
-        if (typeof config.headers.set === 'function') {
-          config.headers.set('Authorization', `Bearer ${token}`);
-        } else {
-          config.headers.Authorization = `Bearer ${token}`;
-        }
-      }
-      return config;
-    });
-
-    // Response Interceptor for 401 Silent Refresh & Session Expiration
-    instance.interceptors.response.use(
-      (response) => response,
-      async (error) => {
-        const originalRequest = error.config;
-
-        if (error.response?.status === 401 && !originalRequest._retry) {
-          if (isRefreshing) {
-            return new Promise(function(resolve, reject) {
-              failedQueue.push({ resolve, reject });
-            }).then(() => {
-              return instance(originalRequest);
-            }).catch(err => {
-              return Promise.reject(err);
-            });
-          }
-
-          originalRequest._retry = true;
-          isRefreshing = true;
-
-          try {
-            const storedRefresh = localStorage.getItem('refresh_token');
-            const payload = storedRefresh ? { refresh: storedRefresh } : {};
-            // FE-P0-02: Use raw unintercepted axios call to avoid self-referential interceptor deadlock
-            const refreshRes = await axios.post(`${API_URL}/api/token/refresh/`, payload, {
-              withCredentials: true,
-            });
-
-            if (refreshRes.data?.access) {
-              localStorage.setItem('access_token', refreshRes.data.access);
-            }
-
-            processQueue(null);
-            return instance(originalRequest);
-          } catch (refreshErr) {
-            processQueue(refreshErr, null);
-            localStorage.removeItem('user');
-            localStorage.removeItem('access_token');
-            localStorage.removeItem('refresh_token');
-            setUser(null);
-
-            toast.error('⏳ Session Expired, Please Log in Again', {
-              duration: 4000,
-            });
-
-            navigate('/login');
-            return Promise.reject(refreshErr);
-          } finally {
-            isRefreshing = false;
-          }
-        }
-        return Promise.reject(error);
-      }
-    );
-
-    return instance;
   }, [navigate]);
 
   // 🚀 HELPER: Fetch absolute latest user profile from backend database
   const refreshUser = async () => {
+    const version = sessionVersion.current;
     try {
       const storedUser = localStorage.getItem('user');
       if (storedUser) {
         const parsedUser = JSON.parse(storedUser);
         if (parsedUser && parsedUser.id) {
           const response = await axiosInstance.get(`/api/users/${parsedUser.id}/`);
+          if (version !== sessionVersion.current) return null;
           setUser(response.data);
           localStorage.setItem('user', JSON.stringify(response.data));
           return response.data;
@@ -135,6 +51,7 @@ export const AuthProvider = ({ children }) => {
   // 2. HYDRATION & PRODUCTION FRESHNESS CHECK ON MOUNT
   useEffect(() => {
     const initializeAuth = async () => {
+      const version = sessionVersion.current;
       const storedUser = localStorage.getItem('user');
 
       if (storedUser) {
@@ -145,14 +62,14 @@ export const AuthProvider = ({ children }) => {
           // Always fetch fresh data on mount to prevent production caching desync
           if (parsedUser && parsedUser.id) {
             const response = await axiosInstance.get(`/api/users/${parsedUser.id}/`);
+            if (version !== sessionVersion.current) return;
             setUser(response.data);
             localStorage.setItem('user', JSON.stringify(response.data));
           }
         } catch (error) {
+          if (version !== sessionVersion.current) return;
           console.error('Session initialization error:', error);
-          localStorage.removeItem('user');
-          localStorage.removeItem('access_token');
-          localStorage.removeItem('refresh_token');
+          if (error.response?.status === 401) localStorage.removeItem('user');
           setUser(null);
         }
       }
@@ -160,29 +77,23 @@ export const AuthProvider = ({ children }) => {
     };
 
     initializeAuth();
-  }, [axiosInstance]);
+  }, []);
 
   // 3. LOGIN USER METHOD
   const loginUser = async (email, password) => {
+    const version = ++sessionVersion.current;
     try {
-      const res = await axios.post(
-        `${API_URL}/api/token/`,
-        { email, password },
-        { withCredentials: true }
-      );
+      const res = await axiosInstance.post('/api/token/', { email, password });
 
       if (res.status === 200) {
-        const { user: userData, access, refresh } = res.data;
-
-        if (access) {
-          localStorage.setItem('access_token', access);
-        }
-        if (refresh) {
-          localStorage.setItem('refresh_token', refresh);
-        }
+        // Confirm the browser accepted its HttpOnly session cookies before reporting success.
+        const profile = await axiosInstance.get(`/api/users/${res.data.user.id}/`);
+        if (version !== sessionVersion.current) return false;
+        const userData = profile.data;
 
         localStorage.setItem('user', JSON.stringify(userData));
         setUser(userData);
+        setLoading(false);
 
         // Guest cart sync algorithm
         const tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
@@ -252,15 +163,18 @@ export const AuthProvider = ({ children }) => {
   // 5. LOGOUT USER METHOD
   const logoutUser = async () => {
     try {
-      await axiosInstance.post('/api/logout/');
-    } catch (err) {
-      console.error('Logout error:', err);
-    } finally {
+      await axiosInstance.logout();
+      sessionVersion.current += 1;
+      setLoading(false);
       setUser(null);
       localStorage.removeItem('user');
       localStorage.removeItem('access_token');
       localStorage.removeItem('refresh_token');
       navigate('/login');
+      return true;
+    } catch (err) {
+      toast.error('Logout failed. Please retry.');
+      return false;
     }
   };
 

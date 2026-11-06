@@ -81,15 +81,15 @@ const Navbar = () => {
   const toggleDropdown = () => setIsDropdownOpen(!isDropdownOpen);
   const toggleMobileMenu = () => setIsMobileMenuOpen(!isMobileMenuOpen);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setIsLoggingOut(true);
-    setTimeout(() => {
-      logoutUser();
-      setIsLoggingOut(false);
-      setTimeout(() => {
+    try {
+      if (await logoutUser()) {
         toast.success('👋 Logged out securely!', { duration: 3000, id: 'logout-success' });
-      }, 250);
-    }, 1000);
+      }
+    } finally {
+      setIsLoggingOut(false);
+    }
   };
 
   const renderNavLinks = () => (

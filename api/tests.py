@@ -1028,26 +1028,17 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.assertTrue(response.cookies['access_token']['httponly'])
         self.assertTrue(response.cookies['refresh_token']['httponly'])
 
-    def test_57b_cookie_dynamic_samesite_detection(self):
-        # 1. Same-site origin (eazyshop.cfd) receives Lax cookies
-        res_lax = self.client.post(
-            '/api/token/',
-            {"email": "cust@test.com", "password": "password123"},
-            format='json',
-            HTTP_ORIGIN='https://eazyshop.cfd'
-        )
-        self.assertEqual(res_lax.status_code, status.HTTP_200_OK)
-        self.assertEqual(res_lax.cookies['access_token']['samesite'], 'Lax')
-
-        # 2. Cross-site origin (e.g. vercel.app) receives None cookies
-        res_none = self.client.post(
-            '/api/token/',
-            {"email": "cust@test.com", "password": "password123"},
-            format='json',
-            HTTP_ORIGIN='https://django-react-ecommerce-platform.vercel.app'
-        )
-        self.assertEqual(res_none.status_code, status.HTTP_200_OK)
-        self.assertEqual(res_none.cookies['access_token']['samesite'], 'None')
+    def test_57b_cookie_policy_is_explicit_and_not_origin_inferred(self):
+        from django.test import override_settings
+        for policy in ('Lax', 'None'):
+            with override_settings(AUTH_COOKIE_SAMESITE=policy, AUTH_COOKIE_SECURE=True):
+                for origin in ('https://eazyshop.cfd', 'https://django-react-ecommerce-platform.vercel.app'):
+                    response = self.client.post('/api/token/', {
+                        'email': 'cust@test.com', 'password': 'password123',
+                    }, format='json', HTTP_ORIGIN=origin)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.cookies['access_token']['samesite'], policy)
+                    self.assertTrue(response.cookies['access_token']['secure'])
 
     def test_57c_dual_auth_bearer_token_fallback(self):
         # Obtain tokens

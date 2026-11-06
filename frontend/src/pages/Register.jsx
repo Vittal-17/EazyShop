@@ -1,7 +1,7 @@
 // src/pages/Register.jsx
 import { useState, useEffect, useContext } from 'react';
 import { useNavigate, Link, useLocation } from 'react-router-dom';
-import axios from 'axios';
+import axios from '../utils/axios';
 import { motion, AnimatePresence } from 'framer-motion';
 // eslint-disable-next-line
 import { toast, Toaster } from "react-hot-toast";
@@ -12,7 +12,6 @@ import FullScreenSpinner from '../components/FullScreenSpinner';
 import AppLayout from '../components/AppLayout';
 import {GlowingPageContainer } from '../styles/SharedPageStyles';
 
-const API_URL = process.env.REACT_APP_API_URL;
 
 const Register = () => {
   const { loginUser } = useContext(AuthContext);
@@ -97,7 +96,7 @@ const Register = () => {
     }
 
     try {
-      const res = await axios.post(`${API_URL}/api/register/`, form);
+      const res = await axios.post('/api/register/', form);
       if (res.status === 201) {
         const loginSuccess = await loginUser(form.email, form.password);
         

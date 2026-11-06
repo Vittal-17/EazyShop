@@ -17,6 +17,7 @@ from pathlib import Path
 
 import dj_database_url
 from decouple import config
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -63,7 +64,7 @@ default_cors_origins = [
     "https://www.eazyshop.cfd",
     "https://api.eazyshop.cfd",
 ]
-if DEBUG or IS_TESTING:
+if DEBUG:
     default_cors_origins.append("http://localhost:3000")
     default_cors_origins.append("http://127.0.0.1:3000")
 
@@ -82,16 +83,29 @@ if env_csrf:
     CSRF_TRUSTED_ORIGINS = [o.strip() for o in env_csrf.split(',') if o.strip()]
 else:
     CSRF_TRUSTED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('https://')]
-    if DEBUG or IS_TESTING:
+    if DEBUG:
         CSRF_TRUSTED_ORIGINS.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
 
 FRONTEND_URL = config('FRONTEND_URL', default='https://eazyshop.cfd')
 
-# 🚀 Cookie Security Defaults (Configurable via environment variables)
-SESSION_COOKIE_SAMESITE = config('SESSION_COOKIE_SAMESITE', default='Lax')
-SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
-CSRF_COOKIE_SAMESITE = config('CSRF_COOKIE_SAMESITE', default='Lax')
-CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
+# One deployment-wide cookie policy, never inferred from an untrusted request.
+# Use None only for explicitly supported HTTPS cross-site deployments.
+
+AUTH_COOKIE_SAMESITE = config('AUTH_COOKIE_SAMESITE', default='Lax')
+AUTH_COOKIE_SECURE = not DEBUG
+if AUTH_COOKIE_SAMESITE not in ('Lax', 'Strict', 'None'):
+    raise ImproperlyConfigured('AUTH_COOKIE_SAMESITE must be Lax, Strict or None.')
+if AUTH_COOKIE_SAMESITE == 'None':
+    AUTH_COOKIE_SECURE = True
+SESSION_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
+SESSION_COOKIE_SECURE = AUTH_COOKIE_SECURE
+CSRF_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
+CSRF_COOKIE_SECURE = AUTH_COOKIE_SECURE
+CSRF_COOKIE_HTTPONLY = True
+CSRF_COOKIE_DOMAIN = None
+CSRF_COOKIE_PATH = '/'
+if not DEBUG and any(not origin.startswith('https://') or '*' in origin for origin in CSRF_TRUSTED_ORIGINS):
+    raise ImproperlyConfigured('Production CSRF origins must be exact HTTPS origins.')
 
 # Application definition
 
