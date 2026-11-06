@@ -5,7 +5,9 @@ from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
+from django.db.models import Exists, OuterRef, Subquery, Sum
+from django.db.models.functions import Cast, Round
 
 
 # ==========================================
@@ -145,7 +147,31 @@ class CartItem(models.Model):
 # ==========================================
 # ORDER SYSTEM
 # ==========================================
+class OrderQuerySet(models.QuerySet):
+    def with_verified_settlement(self):
+        payments = Payment.objects.filter(order_id=OuterRef('pk'))
+        verified_total = (
+            payments.filter(status='completed', verified_at__isnull=False, amount__gt=0)
+            .order_by().values('order_id')
+            .annotate(total=Sum(Cast(Round(models.F('amount') * 100), models.BigIntegerField()))).values('total')
+        )
+        return self.alias(total_minor=Cast(Round(models.F('total_price') * 100), models.BigIntegerField())).filter(
+            Exists(OrderItem.objects.filter(order_id=OuterRef('pk')).exclude(status='cancelled')),
+            ~Exists(payments.filter(status__in=['refunded', 'refund_pending', 'refund_failed'])),
+            total_price__gt=0,
+            total_minor=Subquery(verified_total),
+        )
+
+    def fulfillable(self):
+        return self.with_verified_settlement().filter(status__in=Order.FULFILLABLE_STATUSES)
+
+
 class Order(models.Model):
+    FULFILLABLE_STATUSES = ('paid', 'processing', 'shipped', 'delivered')
+    CONTACT_FIELDS = ('shipping_address', 'contact_phone')
+    CONTACT_EDITABLE_STATUSES = ('pending', 'pending_payment', 'paid', 'processing')
+    objects = OrderQuerySet.as_manager()
+
     STATUS_CHOICES = (
         ('pending', 'Pending'),
         ('pending_payment', 'Pending Payment'),
@@ -155,11 +181,12 @@ class Order(models.Model):
         ('delivered', 'Delivered'),
         ('cancelled', 'Cancelled')
     )
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='orders')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='orders')
     total_price = models.DecimalField(max_digits=10, decimal_places=2)
     shipping_address = models.TextField(blank=True, null=True)
     contact_phone = models.CharField(max_length=20, blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    gateway_order_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -170,39 +197,48 @@ class Order(models.Model):
             models.Index(fields=['created_at']),
         ]
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._original_status = self.status
-
-    def clean(self):
-        super().clean()
-        if self.pk:
-            old_status = getattr(self, '_original_status', None)
-            if old_status is None:
-                try:
-                    old_status = Order.objects.filter(pk=self.pk).values_list('status', flat=True).first()
-                except Exception:
-                    old_status = None
-
-            new_status = self.status
-            if old_status and old_status != new_status:
-                allowed_transitions = {
-                    'pending': ['pending_payment', 'paid', 'processing', 'shipped', 'cancelled'],
-                    'pending_payment': ['pending', 'paid', 'processing', 'shipped', 'cancelled'],
-                    'paid': ['processing', 'shipped', 'cancelled'],
-                    'processing': ['shipped', 'delivered', 'cancelled'],
-                    'shipped': ['delivered', 'cancelled'],
-                    'delivered': [],
-                    'cancelled': ['pending', 'pending_payment', 'paid', 'processing'],
-                }
-                if new_status not in allowed_transitions.get(old_status, []):
-                    raise ValidationError(f"Invalid order status transition from '{old_status}' to '{new_status}'.")
+    def require_verified_settlement(self):
+        if not Order.objects.with_verified_settlement().filter(pk=self.pk).exists():
+            raise ValidationError("Order does not have verified payment settlement.")
 
     def save(self, *args, **kwargs):
-        if self.pk:
+        if self._state.adding:
+            if self.status in self.FULFILLABLE_STATUSES:
+                raise ValidationError("A new order cannot start in a paid or fulfillment state.")
+            return super().save(*args, **kwargs)
+
+        with transaction.atomic():
+            current = Order.objects.select_for_update().get(pk=self.pk)
+            fields = kwargs.get('update_fields')
+            contact_changed = any(
+                (fields is None or field in fields) and getattr(self, field) != getattr(current, field)
+                for field in self.CONTACT_FIELDS
+            )
+            if contact_changed and (
+                current.status not in self.CONTACT_EDITABLE_STATUSES
+                or current.order_items.filter(status__in=['shipped', 'delivered']).exists()
+            ):
+                raise ValidationError("Shipping and contact details are locked after fulfillment starts or the order closes.")
+            if (fields is None or 'status' in fields) and current.status != self.status:
+                transitions = {
+                    'pending': ('pending_payment', 'paid', 'processing', 'cancelled'),
+                    'pending_payment': ('paid', 'processing', 'cancelled'),
+                    'paid': ('processing', 'shipped', 'cancelled'),
+                    'processing': ('shipped', 'cancelled'),
+                    'shipped': ('delivered', 'cancelled'),
+                }
+                if self.status not in transitions.get(current.status, ()):
+                    raise ValidationError("Invalid order status transition.")
+                if self.status in self.FULFILLABLE_STATUSES:
+                    self.require_verified_settlement()
+                active_items = self.order_items.exclude(status='cancelled')
+                if self.status == 'shipped' and not active_items.filter(status__in=['shipped', 'delivered']).exists():
+                    raise ValidationError("Ship an order item before advancing the order.")
+                if self.status == 'delivered' and active_items.exclude(status='delivered').exists():
+                    raise ValidationError("All active order items must be delivered first.")
             self.full_clean()
-        super().save(*args, **kwargs)
-        self._original_status = self.status
+            return super().save(*args, **kwargs)
+
 
 class OrderItem(models.Model):
 
@@ -213,7 +249,7 @@ class OrderItem(models.Model):
         ('cancelled', 'Cancelled'),
     )
 
-    order = models.ForeignKey('Order', on_delete=models.CASCADE, related_name='order_items')
+    order = models.ForeignKey('Order', on_delete=models.PROTECT, related_name='order_items')
     product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, related_name='order_history')
     quantity = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
     price = models.DecimalField(max_digits=10, decimal_places=2)
@@ -235,18 +271,37 @@ class OrderItem(models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        # Auto-calculate the revenue split right before saving to the database
-        if not self.pk: # Only calculate on creation
-            price_decimal = Decimal(str(self.price))
-            quantity_decimal = Decimal(str(self.quantity))
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=self.order_id)
+            if self._state.adding:
+                if self.status in ('shipped', 'delivered') or order.status in Order.FULFILLABLE_STATUSES:
+                    raise ValidationError("Cannot add an item to a settled order or create a fulfilled item.")
+                total = Decimal(str(self.price)) * self.quantity
+                self.platform_fee = total * Decimal('0.10')
+                self.seller_earnings = total - self.platform_fee
+                return super().save(*args, **kwargs)
 
-            total_item_value = price_decimal * quantity_decimal
+            current = OrderItem.objects.get(pk=self.pk)
+            fields = kwargs.get('update_fields')
+            if current.order_id != self.order_id:
+                raise ValidationError("Cannot move an order item to a different order.")
+            if (fields is not None and 'status' not in fields) or current.status == self.status:
+                return super().save(*args, **kwargs)
+            if self.status == 'cancelled' and order.status == 'cancelled':
+                return super().save(*args, **kwargs)
 
-            # EazyShop takes a flat 10% cut
-            self.platform_fee = total_item_value * Decimal('0.10')
-            self.seller_earnings = total_item_value - self.platform_fee
+            next_status = {'pending': 'shipped', 'processing': 'shipped', 'shipped': 'delivered'}
+            if order.status not in ('paid', 'processing', 'shipped') or next_status.get(current.status) != self.status:
+                raise ValidationError("Invalid order item fulfillment transition.")
+            order.require_verified_settlement()
+            super().save(*args, **kwargs)
 
-        super().save(*args, **kwargs)
+            if self.status == 'shipped' and order.status != 'shipped':
+                order.status = 'shipped'
+                order.save(update_fields=['status'])
+            elif self.status == 'delivered' and not order.order_items.exclude(status__in=['cancelled', 'delivered']).exists():
+                order.status = 'delivered'
+                order.save(update_fields=['status'])
 
     def __str__(self):
         return f"{self.quantity} x {self.product.name if self.product else 'Deleted Product'} (Order #{self.order.id})"
@@ -313,7 +368,7 @@ class Payment(models.Model):
         ('refunded', 'Refunded'),
         ('refund_failed', 'Refund Failed'),
     )
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payment')
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name='payment')
 
     # 🚀 REMOVED choices=PAYMENT_METHODS, increased max_length to handle Razorpay's dynamic strings
     payment_method = models.CharField(max_length=50, default='razorpay')
@@ -321,6 +376,7 @@ class Payment(models.Model):
     transaction_id = models.CharField(max_length=100, unique=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    verified_at = models.DateTimeField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

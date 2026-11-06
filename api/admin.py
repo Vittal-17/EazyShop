@@ -1,6 +1,9 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import AdminPasswordChangeForm
+from django.core.exceptions import ValidationError
+
+from .fulfillment import fulfill_order
 
 # Explicit imports are safer than *
 from .models import (
@@ -79,14 +82,47 @@ class ProductAdmin(admin.ModelAdmin):
     list_filter = ('category',)
     search_fields = ('name', 'description')
 
+class CommerceRecordAdmin(admin.ModelAdmin):
+    def has_add_permission(self, request):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(Order)
-class OrderAdmin(admin.ModelAdmin):
+class OrderAdmin(CommerceRecordAdmin):
     list_display = ('id', 'user', 'total_price', 'status', 'created_at', 'contact_phone')
     list_filter = ('status', 'created_at')
     search_fields = ('user__username', 'shipping_address')
+    actions = ['ship_orders', 'deliver_orders']
+
+    def has_fulfill_permission(self, request):
+        return request.user.has_perm('api.change_order')
+
+    def _fulfill_orders(self, request, queryset, status):
+        for order_id in queryset.values_list('pk', flat=True):
+            try:
+                fulfill_order(order_id, status)
+            except (Order.DoesNotExist, ValidationError) as exc:
+                self.message_user(request, f"Order #{order_id}: {exc}", level=messages.ERROR)
+
+    @admin.action(permissions=['fulfill'], description='Ship selected settled orders')
+    def ship_orders(self, request, queryset):
+        self._fulfill_orders(request, queryset, 'shipped')
+
+    @admin.action(permissions=['fulfill'], description='Deliver selected shipped orders')
+    def deliver_orders(self, request, queryset):
+        self._fulfill_orders(request, queryset, 'delivered')
 
 @admin.register(OrderItem)
-class OrderItemAdmin(admin.ModelAdmin):
+class OrderItemAdmin(CommerceRecordAdmin):
     list_display = ('order', 'product', 'quantity', 'price')
 
 @admin.register(Address)
@@ -109,7 +145,7 @@ class CouponAdmin(admin.ModelAdmin):
     search_fields = ('code',)
 
 @admin.register(Payment)
-class PaymentAdmin(admin.ModelAdmin):
+class PaymentAdmin(CommerceRecordAdmin):
     list_display = ('order', 'payment_method', 'amount', 'status', 'created_at')
     list_filter = ('status', 'payment_method')
 

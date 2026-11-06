@@ -1,10 +1,9 @@
-from decimal import Decimal
 from api.utils.async_tasks import run_async
 
 from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as ModelValidationError
 from django.db import transaction
 from rest_framework import serializers
-from rest_framework.exceptions import PermissionDenied
 
 from .email_service import send_welcome_email
 from .models import (
@@ -172,11 +171,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
             'name', 'description', 'image_url', 'status', 'seller_earnings',
             'username', 'shipping_address'  # 🚀 Included here
         ]
-        read_only_fields = ['id', 'price', 'seller_earnings', 'order', 'username', 'shipping_address']
+        read_only_fields = fields
 
 
 class OrderSerializer(serializers.ModelSerializer):
-    order_items = OrderItemSerializer(many=True)
+    order_items = OrderItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -184,74 +183,17 @@ class OrderSerializer(serializers.ModelSerializer):
             'id', 'user', 'status', 'created_at', 'order_items',
             'total_price', 'shipping_address', 'contact_phone'
         ]
-        read_only_fields = ['id', 'user', 'created_at', 'total_price']
-
-    def validate(self, data):
-        if not self.instance:
-            shipping_address = data.get('shipping_address')
-            contact_phone = data.get('contact_phone')
-            if not shipping_address or not str(shipping_address).strip() or not contact_phone or not str(contact_phone).strip():
-                raise serializers.ValidationError("Order placement failed: A valid shipping address and contact phone number are compulsory.")
-        return data
+        read_only_fields = ['id', 'user', 'status', 'created_at', 'total_price']
 
     def update(self, instance, validated_data):
-        request = self.context.get('request')
-        user = request.user if request else None
-
-        if 'status' in validated_data:
-            if user and getattr(user, 'role', None) == 'admin':
-                instance.status = validated_data['status']
-            else:
-                raise PermissionDenied(detail="You do not have permission to do this!")
-
-        instance.shipping_address = validated_data.get('shipping_address', instance.shipping_address)
-        instance.contact_phone = validated_data.get('contact_phone', instance.contact_phone)
-        instance.save()
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if validated_data:
+            try:
+                instance.save(update_fields=validated_data.keys())
+            except ModelValidationError as exc:
+                raise serializers.ValidationError(getattr(exc, 'message_dict', exc.messages)) from exc
         return instance
-
-    def create(self, validated_data):
-        order_items_data = validated_data.pop('order_items')
-        user = validated_data.pop('user', self.context['request'].user)
-
-        with transaction.atomic():
-            # Deterministic lock ordering: sort product IDs to guarantee deadlock freedom
-            product_ids = sorted({item_data['product'].id for item_data in order_items_data})
-            products_qs = Product.objects.select_for_update().filter(id__in=product_ids).order_by('id')
-            products_map = {p.id: p for p in products_qs}
-
-            total_price = Decimal('0.00')
-
-            for item_data in order_items_data:
-                product_id = item_data['product'].id
-                product = products_map.get(product_id)
-
-                # 🚨 SECURITY CHECK: Ensure product hasn't been soft-deleted or rejected
-                if not product or not getattr(product, 'is_active', True) or getattr(product, 'approval_status', 'approved') != 'approved':
-                    product_name = product.name if product else f"ID {product_id}"
-                    raise serializers.ValidationError(f"Checkout failed: '{product_name}' is no longer available.")
-
-                if item_data['quantity'] > product.stock:
-                    raise serializers.ValidationError(f"Checkout failed: '{product.name}' only has {product.stock} units left.")
-
-                actual_price = product.price
-                total_price += item_data['quantity'] * actual_price
-
-                # Inject server-verified data into the dictionary
-                item_data['price'] = actual_price
-                item_data['vendor'] = product.vendor  # 🚀 THIS ROUTES THE FUNDS!
-
-                product.stock -= item_data['quantity']
-                product.save(update_fields=['stock'])
-
-            order = Order.objects.create(user=user, total_price=total_price, **validated_data)
-
-            for item_data in order_items_data:
-                OrderItem.objects.create(order=order, **item_data)
-
-            if 'request' in self.context:
-                CartItem.objects.filter(cart__user=self.context['request'].user).delete()
-
-        return order
 
 
 # ==========================================
@@ -285,7 +227,7 @@ class CouponSerializer(serializers.ModelSerializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = '__all__'
+        exclude = ['verified_at']
 
 class AdminLogSerializer(serializers.ModelSerializer):
     class Meta:

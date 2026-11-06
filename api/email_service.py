@@ -11,7 +11,7 @@ from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.utils.html import escape, strip_tags
 
-from .models import Payment
+from .models import Order, Payment
 
 # 🚀 Fetch the dynamic production URL (Defaults to localhost for local testing)
 FRONTEND_URL = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000').rstrip('/')
@@ -315,6 +315,8 @@ def async_notify_vendors(order):
     def send_emails():
         for vendor_email, data in vendor_groups.items():
             try:
+                if not Order.objects.fulfillable().filter(pk=order_id).exists():
+                    return
                 send_vendor_new_order_email(
                     to_email=vendor_email,
                     username=data['username'],

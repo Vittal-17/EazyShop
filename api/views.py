@@ -17,7 +17,9 @@ import uuid
 from django.conf import settings
 from django.core.cache import cache
 from django.core.mail import send_mail
+from django.core.exceptions import ValidationError as ModelValidationError
 from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError
 
 from django.utils import timezone
 from datetime import timedelta
@@ -41,7 +43,7 @@ import sys
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import generics, mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
@@ -60,6 +62,8 @@ from .email_service import (
     send_vendor_new_order_email,
     async_notify_vendors
 )
+from .fulfillment import fulfill_order
+from .settlement import record_gateway_capture
 from .models import (
     Address,
     AdminLog,
@@ -175,7 +179,13 @@ class UserViewSet(
         if remaining_after == 0:
             return Response({"error": "Cannot delete the last administrator account — at least one admin must remain for admin panel access."},
                             status=status.HTTP_400_BAD_REQUEST)
-        return super().destroy(request, *args, **kwargs)
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {"error": "This account has order history and cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
 
     def get_serializer_class(self):
@@ -602,7 +612,20 @@ class ProductViewSet(viewsets.ModelViewSet):
 # 3. CART & ORDERS
 # ==========================================
 
-class OrderViewSet(viewsets.ModelViewSet):
+def can_manage_orders(user):
+    return user.role == 'admin' or (user.is_staff and user.has_perm('api.change_order'))
+
+
+def can_view_all_orders(user):
+    return can_manage_orders(user) or (user.is_staff and user.has_perm('api.view_order'))
+
+
+class OrderViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
     serializer_class = OrderSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = StandardResultsSetPagination
@@ -611,7 +634,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'total_price']
 
     def get_throttles(self):
-        if self.action in ['create', 'create_razorpay_order']:
+        if self.action == 'create_razorpay_order':
             return [CheckoutRateThrottle()]
         return super().get_throttles()
 
@@ -622,7 +645,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return queryset.none()
 
-        if getattr(user, 'role', '') == 'admin' or user.is_staff:
+        if can_view_all_orders(user):
             return queryset.all()
 
         return queryset.filter(user=user)
@@ -637,32 +660,36 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-    def perform_update(self, serializer):
-        user = self.request.user
-        is_admin = getattr(user, 'role', '') == 'admin' or user.is_staff
+    def update(self, request, *args, **kwargs):
+        order = self.get_object()
+        user = request.user
+        if order.user_id != user.pk and not can_manage_orders(user):
+            raise PermissionDenied("Only authorized staff can edit another customer's order.")
+        if 'order_items' in request.data:
+            raise ValidationError({"order_items": "Order items cannot be edited."})
+        if 'status' not in request.data:
+            return super().update(request, *args, **kwargs)
 
-        instance = self.get_object()
-        old_status = instance.status
+        if not can_manage_orders(user):
+            raise ValidationError({"status": "Only authorized staff can change order status."})
+        if set(request.data) != {'status'}:
+            raise ValidationError({"status": "Submit status changes separately."})
 
-        new_status = serializer.validated_data.get('status', old_status)
-        if old_status != new_status and not is_admin:
-            raise serializers.ValidationError({"status": "❌ Permission Denied: Only administrators can update order statuses."})
-
-        new_instance = serializer.save()
-
-        if old_status != new_instance.status:
-            new_instance.order_items.update(status=new_instance.status)
-            log_admin_action(user, f"Order #{new_instance.id} Status: '{old_status}' -> '{new_instance.status}'")
-            self.send_order_status_email(new_instance)
-            invalidate_invoice_cache(new_instance.id)
-
-    def destroy(self, request, *args, **kwargs):
-        if not (getattr(request.user, 'role', '') == 'admin' or request.user.is_staff or request.user.is_superuser):
-            return Response(
-                {"error": "Order deletion is restricted to administrators."},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        return super().destroy(request, *args, **kwargs)
+        new_status = request.data['status']
+        if new_status == 'cancelled':
+            response = self.cancel(request, pk=order.pk)
+            if response.status_code != status.HTTP_200_OK:
+                return response
+            order = Order.objects.get(pk=order.pk)
+        else:
+            try:
+                order, changed = fulfill_order(order.pk, new_status)
+            except ModelValidationError as exc:
+                raise ValidationError({"status": exc.messages}) from exc
+            if changed:
+                log_admin_action(user, f"Updated fulfillment for order #{order.id}: {new_status}")
+                self.send_order_status_email(order)
+        return Response(self.get_serializer(order).data)
 
     def send_order_status_email(self, order):
         order_id = order.id
@@ -695,15 +722,17 @@ class OrderViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             # 🚀 ADV-FIN-01: Acquire exclusive row-level lock on the Order to eliminate concurrent cancellation races
             try:
-                order = self.get_queryset().select_for_update().get(id=pk)
+                order = self.get_queryset().select_related(None).prefetch_related(None).select_for_update().get(id=pk)
             except Order.DoesNotExist:
                 return Response({"error": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
 
+            if order.user_id != request.user.pk and not can_manage_orders(request.user):
+                raise PermissionDenied("Only authorized staff can cancel another customer's order.")
             if order.status not in ['pending', 'pending_payment', 'paid', 'processing']:
                 return Response({"error": "Cannot cancel non-pending order."}, status=status.HTTP_400_BAD_REQUEST)
 
             order.status = 'cancelled'
-            order.save()
+            order.save(update_fields=['status'])
 
             # Deterministic product locking in ascending ID order to eliminate deadlocks
             order_items = list(order.order_items.select_related('product').all())
@@ -835,7 +864,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                 return Response({"error": "Each order item must be an object."}, status=status.HTTP_400_BAD_REQUEST)
             p_id = item.get('product')
             qty = item.get('quantity', 0)
-            if not p_id or not isinstance(qty, int) or qty <= 0:
+            if type(p_id) is not int or p_id <= 0 or type(qty) is not int or qty <= 0:
                 release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
                 return Response(
                     {"error": f"Invalid quantity for product {p_id}. Provide a positive integer."},
@@ -886,6 +915,10 @@ class OrderViewSet(viewsets.ModelViewSet):
                 server_total_price += item_subtotal
                 verified_items.append((product, requested_qty, product.price))
 
+            if server_total_price <= 0:
+                release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                return Response({"error": "Order total must be positive."}, status=status.HTTP_400_BAD_REQUEST)
+
             # --- ATOMIC STOCK RESERVATION ---
             for product, qty, price in verified_items:
                 product.stock -= qty
@@ -931,15 +964,13 @@ class OrderViewSet(viewsets.ModelViewSet):
                         payment_method='wallet',
                         transaction_id=unique_txn_id,
                         amount=wallet_deducted,
-                        status='completed'
+                        status='completed',
+                        verified_at=timezone.now()
                     )
 
                     # Fully paid via wallet — finalize
                     order.status = 'processing'
-                    order.save()
-                    for item in order.order_items.all():
-                        item.status = 'processing'
-                        item.save()
+                    order.save(update_fields=['status'])
 
                     CartItem.objects.filter(cart__user=request.user).delete()
                     self.send_order_status_email(order)
@@ -970,7 +1001,8 @@ class OrderViewSet(viewsets.ModelViewSet):
                         payment_method='wallet',
                         transaction_id=unique_txn_id,
                         amount=wallet_deducted,
-                        status='completed'
+                        status='completed',
+                        verified_at=timezone.now()
                     )
 
                     remaining_amount = server_total_price - wallet_deducted
@@ -1000,6 +1032,8 @@ class OrderViewSet(viewsets.ModelViewSet):
             release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
             raise
 
+        order.gateway_order_id = razorpay_order['id']
+        order.save(update_fields=['gateway_order_id'])
         resp_data = {
             "order_id": order.id,
             "razorpay_order_id": razorpay_order['id'],
@@ -1036,125 +1070,30 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({"success": False, "message": "Payment ID and order ID are required."},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
-        # --- IDEMPOTENCY: skip if already finalized (webhook or prior callback) ---
-        if Payment.objects.filter(order_id=order_id, payment_method='razorpay', status='completed').exists():
-            existing = Payment.objects.get(order_id=order_id, payment_method='razorpay', status='completed')
-            resp_data = {
-                "success": True,
-                "message": "Payment already finalized (idempotent replay).",
-                "order_id": order_id,
-                "payment": PaymentSerializer(existing).data
-            }
-            store_idempotency_result(request.user.id, "verify_razorpay_payment", idem_key, resp_data, status.HTTP_200_OK)
-            return Response(resp_data, status=status.HTTP_200_OK)
-
         try:
-            payment_details = client.payment.fetch(payment_id)
-            if payment_details.get('status') != 'captured':
-                release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-                return Response({"success": False, "message": "Payment not captured by gateway."},
-                                status=status.HTTP_400_BAD_REQUEST)
-
+            order = Order.objects.filter(pk=order_id, user=request.user).first()
+            if not order or not order.gateway_order_id or order.gateway_order_id != request.data.get('razorpay_order_id'):
+                raise ModelValidationError("Payment does not match this order.")
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
             client.utility.verify_payment_signature({
-                'razorpay_order_id': request.data.get('razorpay_order_id'),
+                'razorpay_order_id': order.gateway_order_id,
                 'razorpay_payment_id': payment_id,
                 'razorpay_signature': request.data.get('razorpay_signature')
             })
-
-            actual_method = payment_details.get('method', 'razorpay')
-            gateway_amount = Decimal(str(payment_details.get('amount', 0))) / 100
+            payment_details = client.payment.fetch(payment_id)
+            if payment_details.get('id') != payment_id:
+                raise ModelValidationError("Payment ID does not match the gateway response.")
 
             with transaction.atomic():
-                order = Order.objects.get(id=order_id, user=request.user)
-                user = User.objects.select_for_update().get(id=request.user.id)
-
-                # --- FIN-08: RECONCILE AMOUNT. The gateway must have paid exactly (total - reserved wallet) ---
-                wallet_deducted = Decimal('0.00')
-                notes = payment_details.get('notes', {})
-                if 'wallet_deducted' in notes:
-                    wallet_deducted = Decimal(str(notes['wallet_deducted']))
-
-                expected_gateway_amount = order.total_price - wallet_deducted
-                if gateway_amount < expected_gateway_amount - Decimal('0.01'):  # 1 paisa tolerance
-                    release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-                    logger.error(
-                        f"[FRAUD/ERROR] Underpaid Razorpay callback: order={order.id}, "
-                        f"expected_gateway_amount={expected_gateway_amount}, received={gateway_amount}, "
-                        f"wallet_deducted={wallet_deducted}"
-                    )
-                    return Response({"success": False, "message": "Payment amount mismatch. Underpaid or tampered transaction."},
-                                    status=status.HTTP_400_BAD_REQUEST)
-
-                # Wallet portion reconciliation:
-                # In standard checkout, the wallet leg was already atomically deducted and recorded at order creation.
-                if wallet_deducted > 0:
-                    wallet_payment = Payment.objects.filter(
-                        order=order,
-                        payment_method='wallet',
-                        status='completed',
-                        amount=wallet_deducted
-                    ).first()
-
-                    if not wallet_payment:
-                        # Fallback for isolated unit tests that don't invoke create_razorpay_order:
-                        if user.wallet_balance >= wallet_deducted:
-                            record_wallet_transaction(
-                                user=user,
-                                amount=wallet_deducted,
-                                transaction_type='DEBIT_ORDER',
-                                reference_id=f"ORDER-{order.id}",
-                                description=f"Finalized fallback wallet payment for Order #{order.id}"
-                            )
-                            Payment.objects.create(
-                                order=order,
-                                payment_method='wallet',
-                                transaction_id=notes.get('wallet_deducted_txid', f'wallet_{uuid.uuid4().hex[:8]}_finalized'),
-                                amount=wallet_deducted,
-                                status='completed'
-                            )
-                        else:
-                            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
-                            logger.error(f"[FRAUD] Split-payment wallet race: order={order.id}")
-                            return Response({"success": False,
-                                             "message": "Payment verification failed: wallet reserve exhausted."},
-                                            status=status.HTTP_400_BAD_REQUEST)
-
-                # Register the RAZORPAY payment leg with authoritative gateway amount
-                payment, created = Payment.objects.get_or_create(
-                    order=order,
-                    transaction_id=payment_id,
-                    defaults={
-                        'payment_method': actual_method,
-                        'amount': gateway_amount,  # authoritative from Razorpay
-                        'status': 'completed'
-                    }
-                )
-
-                if created:
-                    # Restore stock if this was a re-tried failed order (edge case)
-                    if order.status == 'cancelled':
-                        order.status = 'pending_payment'
-                        order.save()
-                        for item in order.order_items.all():
-                            item.status = 'pending'
-                            item.save()
-                            if item.product:
-                                product = Product.objects.select_for_update().get(id=item.product.id)
-                                product.stock += item.quantity
-                                product.save()
-
-                    # Advance state machine
-                    if order.status == 'pending_payment':
-                        order.status = 'paid'
-                        order.save()
-
-                    # Cart is now paid — clear it
-                    CartItem.objects.filter(cart__user=request.user).delete()
-
-            self.send_order_status_email(order)
-            transaction.on_commit(lambda: async_notify_vendors(order))
+                order = Order.objects.select_for_update().get(pk=order.pk, user=request.user)
+                if order.status == 'cancelled':
+                    raise ModelValidationError("This order was cancelled. Check its payment or refund status.")
+                payment, finalized = record_gateway_capture(order, payment_details)
+                if payment.status != 'completed':
+                    raise ModelValidationError("Payment is no longer settled.")
+                if finalized:
+                    self.send_order_status_email(order)
+                    transaction.on_commit(lambda: async_notify_vendors(order))
 
             resp_data = {
                 "success": True,
@@ -1165,6 +1104,9 @@ class OrderViewSet(viewsets.ModelViewSet):
             store_idempotency_result(request.user.id, "verify_razorpay_payment", idem_key, resp_data, status.HTTP_200_OK)
             return Response(resp_data, status=status.HTTP_200_OK)
 
+        except ModelValidationError as exc:
+            release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
+            return Response({"success": False, "message": exc.messages[0]}, status=status.HTTP_400_BAD_REQUEST)
         except razorpay.errors.SignatureVerificationError:
             release_idempotency_lock(request.user.id, "verify_razorpay_payment", idem_key)
             logger.warning(f"[FRAUD] Invalid Razorpay signature, order={order_id}")
@@ -1190,11 +1132,15 @@ class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = super().get_queryset()
 
         # Admin / staff / superuser: full platform visibility
-        if getattr(user, 'role', '') == 'admin' or user.is_staff or user.is_superuser:
+        if can_view_all_orders(user):
             pass
         # Vendor: visible if they sold the item or if they are the buyer
         elif getattr(user, 'role', '') == 'seller':
-            queryset = queryset.filter(Q(order__user=user) | Q(vendor=user)).distinct()
+            queryset = queryset.filter(
+                Q(order__user=user) | (
+                    Q(vendor=user, order__in=Order.objects.fulfillable()) & ~Q(status='cancelled')
+                )
+            )
         # Customer: strictly limited to items in orders they placed
         else:
             queryset = queryset.filter(order__user=user)
@@ -1362,7 +1308,7 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
         if getattr(user, 'role', '') == 'admin':
             return base_qs
         if getattr(user, 'role', '') == 'seller':
-            return base_qs.filter(vendor=user)
+            return base_qs.filter(vendor=user, order__in=Order.objects.fulfillable()).exclude(status='cancelled')
 
         return OrderItem.objects.none()
 
@@ -1378,24 +1324,16 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        if new_status not in ['shipped', 'delivered', 'cancelled']:
-            return Response({"error": "Invalid status"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            _, changed = fulfill_order(
+                item.order_id, new_status, item_id=item.pk,
+                vendor_id=None if user.role == 'admin' else user.pk,
+            )
+        except ModelValidationError as exc:
+            raise ValidationError({"status": exc.messages}) from exc
 
-        item.status = new_status
-        item.save()
-
-        order = item.order
-        all_items = order.order_items.all()
-
-        if all(i.status == 'delivered' for i in all_items):
-            order.status = 'delivered'
-        elif any(i.status == 'shipped' for i in all_items):
-            order.status = 'shipped'
-        elif all(i.status == 'cancelled' for i in all_items):
-            order.status = 'cancelled'
-        order.save()
-
-        self.notify_customer_async(item)
+        if changed:
+            transaction.on_commit(lambda: self.notify_customer_async(changed[0]))
         return Response({"message": f"Item marked as {new_status}"}, status=status.HTTP_200_OK)
 
     def notify_customer_async(self, item):
@@ -1405,7 +1343,7 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
                 payment = Payment.objects.filter(order=order).first()
 
                 if payment:
-                    payment_method_display = payment.get_payment_method_display()
+                    payment_method_display = payment.payment_method.capitalize()
                     transaction_id_display = payment.transaction_id or "Verified Transaction"
                 else:
                     payment_method_display = "Completed"
@@ -1640,205 +1578,166 @@ def razorpay_webhook(request):
         order_entity = payload.get('payload', {}).get('order', {}).get('entity', {})
         refund_entity = payload.get('payload', {}).get('refund', {}).get('entity', {})
 
-        django_order_id = (
-            payment_entity.get('notes', {}).get('django_order_id')
-            or order_entity.get('notes', {}).get('django_order_id')
-            or refund_entity.get('notes', {}).get('order_id')
-            or refund_entity.get('notes', {}).get('django_order_id')
-        )
+        refund_payment_id = refund_entity.get('payment_id')
+        refunded_capture = None
+        if event == 'refund.processed' and refund_payment_id:
+            existing_payment = Payment.objects.filter(transaction_id=refund_payment_id).exclude(
+                payment_method='wallet'
+            ).first()
+            if existing_payment:
+                order_lookup = {'pk': existing_payment.order_id}
+            else:
+                # A refund event can arrive before the capture event. Resolve it using
+                # the provider's payment record and leave a terminal payment record.
+                try:
+                    refunded_capture = client.payment.fetch(refund_payment_id, timeout=5)
+                except Exception:
+                    logger.exception("Could not resolve a Razorpay refund to its order")
+                    return HttpResponse(status=503)
+                if (
+                    refunded_capture.get('id') != refund_payment_id
+                    or refunded_capture.get('currency') != 'INR'
+                    or not refunded_capture.get('order_id')
+                    or type(refunded_capture.get('amount')) is not int
+                    or refunded_capture['amount'] <= 0
+                ):
+                    return HttpResponse(status=400)
+                order_lookup = {'gateway_order_id': refunded_capture['order_id']}
+        elif event in ('payment.captured', 'order.paid', 'payment.authorized', 'payment.failed'):
+            gateway_order_id = payment_entity.get('order_id')
+            if not gateway_order_id:
+                return HttpResponse(status=200)
+            if event == 'order.paid' and order_entity.get('id') != gateway_order_id:
+                return HttpResponse(status=400)
+            order_lookup = {'gateway_order_id': gateway_order_id}
+        else:
+            return HttpResponse(status=200)
 
-        if not django_order_id and refund_entity.get('payment_id'):
-            ref_payment = Payment.objects.filter(transaction_id=refund_entity.get('payment_id')).first()
-            if ref_payment:
-                django_order_id = ref_payment.order_id
-
-        # 🚀 FIX 1: Extracted 'method' safely from the payment_entity dictionary
-        actual_method = payment_entity.get('method', 'razorpay')
-
-        if django_order_id:
-            with transaction.atomic():
-                order = Order.objects.select_for_update().filter(id=django_order_id).first()
-
-                if order:
-                    # 1. PAYMENT CAPTURED (Success or Retry Success)
-                    if event == 'payment.captured':
-                        transaction_id = payment_entity.get('id')
-
-                        raw_amount = payment_entity.get('amount')
-                        captured_amount = Decimal(str(raw_amount)) / Decimal('100.00') if raw_amount else order.total_price
-
-                        payment_record = Payment.objects.filter(transaction_id=transaction_id).first()
-                        if not payment_record:
-                            payment_record = Payment.objects.create(
-                                order=order,
-                                payment_method=actual_method,
-                                transaction_id=transaction_id,
-                                amount=captured_amount,
-                                status='completed'
-                            )
-                        else:
-                            payment_record.status = 'completed'
-                            payment_record.save(update_fields=['status'])
-
-                        # Revive the order safely if previously cancelled
+        late_capture = None
+        with transaction.atomic():
+            order = Order.objects.select_for_update().filter(**order_lookup).first()
+            if order:
+                if event in ('payment.captured', 'order.paid'):
+                    try:
+                        payment, finalized = record_gateway_capture(order, payment_entity)
+                    except ModelValidationError as exc:
+                        logger.warning("Rejected Razorpay capture for order %s: %s", order.pk, exc)
+                        return HttpResponse(status=400)
+                    if finalized:
                         if order.status == 'cancelled':
-                            order_items = [item for item in order.order_items.select_related('product').all() if item.product]
-                            sorted_product_ids = sorted(list({item.product.id for item in order_items}))
+                            late_capture = (payment.pk, payment.transaction_id, payment.amount, order.pk)
+                        else:
+                            transaction.on_commit(lambda: async_notify_vendors(order))
 
-                            locked_products = {}
-                            if sorted_product_ids:
-                                locked_products = {
-                                    p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
-                                }
+                elif event == 'payment.authorized':
+                    transaction_id = payment_entity.get('id')
+                    amount = payment_entity.get('amount')
+                    method = payment_entity.get('method', 'razorpay')
+                    if transaction_id and type(amount) is int and amount > 0 and method != 'wallet':
+                        Payment.objects.get_or_create(transaction_id=transaction_id, defaults={
+                            'order': order, 'payment_method': method, 'amount': Decimal(amount) / 100,
+                            'status': 'authorized',
+                        })
 
-                            needed_quantities = {}
-                            for item in order_items:
-                                needed_quantities[item.product.id] = needed_quantities.get(item.product.id, 0) + item.quantity
+                # 4. REFUND PROCESSED (Gateway automated refund event)
+                elif event == 'refund.processed':
+                    if refunded_capture:
+                        payment, _ = Payment.objects.get_or_create(transaction_id=refund_payment_id, defaults={
+                            'order': order, 'amount': Decimal(refunded_capture['amount']) / 100, 'status': 'refunded',
+                        })
+                        if payment.order_id != order.pk or payment.payment_method == 'wallet':
+                            return HttpResponse(status=400)
+                    order.payment.filter(transaction_id=refund_payment_id).exclude(payment_method='wallet').update(status='refunded')
 
-                            can_fulfill = all(
-                                p_id in locked_products and locked_products[p_id].stock >= qty
-                                for p_id, qty in needed_quantities.items()
-                            )
+                    if order.status in ('pending', 'pending_payment', 'paid', 'processing'):
+                        order.status = 'cancelled'
+                        order.save(update_fields=['status'])
 
-                            if can_fulfill:
-                                for p_id, qty in needed_quantities.items():
-                                    product = locked_products[p_id]
-                                    product.stock -= qty
+                        sorted_product_ids = sorted(list({
+                            it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
+                        }))
+                        locked_products = {
+                            p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
+                        } if sorted_product_ids else {}
+
+                        for item in order.order_items.all():
+                            if item.status != 'cancelled':
+                                item.status = 'cancelled'
+                                item.save(update_fields=['status'])
+                                if item.product_id and item.product_id in locked_products:
+                                    product = locked_products[item.product_id]
+                                    product.stock += item.quantity
                                     product.save(update_fields=['stock'])
 
-                                order.status = 'paid'
-                                order.save(update_fields=['status'])
-                                order.order_items.update(status='pending')
-                                CartItem.objects.filter(cart__user=order.user).delete()
-                            else:
-                                logger.error(
-                                    f"[WEBHOOK REVIVAL FAILED] Order #{order.id} cannot be revived due to "
-                                    f"insufficient inventory. Order remains cancelled. Initiating refund for payment {transaction_id}."
+                        wallet_payments = Payment.objects.select_for_update().filter(
+                            order=order,
+                            payment_method='wallet',
+                            status='completed'
+                        )
+                        if wallet_payments.exists():
+                            order_user = User.objects.select_for_update().get(id=order.user_id)
+                            for wp in wallet_payments:
+                                record_wallet_transaction(
+                                    user=order_user,
+                                    amount=wp.amount,
+                                    transaction_type='REFUND_ORDER',
+                                    reference_id=f"ORDER-{order.id}",
+                                    description=f"Refunded wallet payment for Refunded Order #{order.id}"
                                 )
-                                try:
-                                    refund_payload = {
-                                        'amount': int(captured_amount * 100),
-                                        'notes': {'order_id': str(order.id), 'reason': 'Auto-refund: Insufficient inventory on revival'}
-                                    }
-                                    client.payment.refund(transaction_id, refund_payload)
-                                    payment_record.status = 'refunded'
-                                except Exception as refund_err:
-                                    logger.error(f"[WEBHOOK REFUND ERROR] Failed to auto-refund {transaction_id}: {refund_err}")
-                                    payment_record.status = 'refund_failed'
-                                payment_record.save(update_fields=['status'])
+                                wp.status = 'refunded'
+                                wp.save(update_fields=['status'])
 
-                        elif order.status in ['pending', 'pending_payment']:
-                            order.status = 'paid'
-                            order.save(update_fields=['status'])
-                            order.order_items.update(status='pending')
-                            CartItem.objects.filter(cart__user=order.user).delete()
+                # 5. PAYMENT FAILED (Declined / Dropped)
+                elif event == 'payment.failed':
+                    if order.status in ['pending', 'pending_payment']:
+                        order.status = 'cancelled'
+                        order.save(update_fields=['status'])
 
-                    # 2. PAYMENT AUTHORIZED (Pre-capture event)
-                    elif event == 'payment.authorized':
-                        transaction_id = payment_entity.get('id')
-                        if transaction_id and not Payment.objects.filter(transaction_id=transaction_id).exists():
-                            raw_amount = payment_entity.get('amount')
-                            auth_amount = Decimal(str(raw_amount)) / Decimal('100.00') if raw_amount else order.total_price
-                            Payment.objects.create(
-                                order=order,
-                                payment_method=actual_method,
-                                transaction_id=transaction_id,
-                                amount=auth_amount,
-                                status='authorized'
-                            )
+                        sorted_product_ids = sorted(list({
+                            it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
+                        }))
+                        locked_products = {
+                            p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
+                        } if sorted_product_ids else {}
 
-                    # 3. ORDER PAID (Full order reconciliation event)
-                    elif event == 'order.paid':
-                        if order.status in ['pending', 'pending_payment']:
-                            order.status = 'paid'
-                            order.save(update_fields=['status'])
-                            order.order_items.filter(status='pending').update(status='pending')
-                            CartItem.objects.filter(cart__user=order.user).delete()
+                        for item in order.order_items.all():
+                            if item.status != 'cancelled':
+                                item.status = 'cancelled'
+                                item.save(update_fields=['status'])
+                                if item.product_id and item.product_id in locked_products:
+                                    product = locked_products[item.product_id]
+                                    product.stock += item.quantity
+                                    product.save(update_fields=['stock'])
 
-                    # 4. REFUND PROCESSED (Gateway automated refund event)
-                    elif event == 'refund.processed':
-                        refund_payment_id = refund_entity.get('payment_id') or payment_entity.get('id')
-                        if refund_payment_id:
-                            Payment.objects.filter(transaction_id=refund_payment_id).update(status='refunded')
+                        # Restore reserved wallet payment if any
+                        wallet_payments = Payment.objects.select_for_update().filter(
+                            order=order,
+                            payment_method='wallet',
+                            status='completed'
+                        )
+                        if wallet_payments.exists():
+                            order_user = User.objects.select_for_update().get(id=order.user_id)
+                            for wp in wallet_payments:
+                                record_wallet_transaction(
+                                    user=order_user,
+                                    amount=wp.amount,
+                                    transaction_type='REFUND_ORDER',
+                                    reference_id=f"ORDER-{order.id}",
+                                    description=f"Refunded wallet payment for Failed Order #{order.id}"
+                                )
+                                wp.status = 'refunded'
+                                wp.save(update_fields=['status'])
 
-                        if order.status != 'cancelled':
-                            order.status = 'cancelled'
-                            order.save(update_fields=['status'])
-
-                            sorted_product_ids = sorted(list({
-                                it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
-                            }))
-                            locked_products = {
-                                p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
-                            } if sorted_product_ids else {}
-
-                            for item in order.order_items.all():
-                                if item.status != 'cancelled':
-                                    item.status = 'cancelled'
-                                    item.save(update_fields=['status'])
-                                    if item.product_id and item.product_id in locked_products:
-                                        product = locked_products[item.product_id]
-                                        product.stock += item.quantity
-                                        product.save(update_fields=['stock'])
-
-                            wallet_payments = Payment.objects.select_for_update().filter(
-                                order=order,
-                                payment_method='wallet',
-                                status='completed'
-                            )
-                            if wallet_payments.exists():
-                                order_user = User.objects.select_for_update().get(id=order.user_id)
-                                for wp in wallet_payments:
-                                    record_wallet_transaction(
-                                        user=order_user,
-                                        amount=wp.amount,
-                                        transaction_type='REFUND_ORDER',
-                                        reference_id=f"ORDER-{order.id}",
-                                        description=f"Refunded wallet payment for Refunded Order #{order.id}"
-                                    )
-                                    wp.status = 'refunded'
-                                    wp.save(update_fields=['status'])
-
-                    # 5. PAYMENT FAILED (Declined / Dropped)
-                    elif event == 'payment.failed':
-                        if order.status in ['pending', 'pending_payment']:
-                            order.status = 'cancelled'
-                            order.save(update_fields=['status'])
-
-                            sorted_product_ids = sorted(list({
-                                it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
-                            }))
-                            locked_products = {
-                                p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
-                            } if sorted_product_ids else {}
-
-                            for item in order.order_items.all():
-                                if item.status != 'cancelled':
-                                    item.status = 'cancelled'
-                                    item.save(update_fields=['status'])
-                                    if item.product_id and item.product_id in locked_products:
-                                        product = locked_products[item.product_id]
-                                        product.stock += item.quantity
-                                        product.save(update_fields=['stock'])
-
-                            # Restore reserved wallet payment if any
-                            wallet_payments = Payment.objects.select_for_update().filter(
-                                order=order,
-                                payment_method='wallet',
-                                status='completed'
-                            )
-                            if wallet_payments.exists():
-                                order_user = User.objects.select_for_update().get(id=order.user_id)
-                                for wp in wallet_payments:
-                                    record_wallet_transaction(
-                                        user=order_user,
-                                        amount=wp.amount,
-                                        transaction_type='REFUND_ORDER',
-                                        reference_id=f"ORDER-{order.id}",
-                                        description=f"Refunded wallet payment for Failed Order #{order.id}"
-                                    )
-                                    wp.status = 'refunded'
-                                    wp.save(update_fields=['status'])
+        if late_capture:
+            payment_pk, transaction_id, amount, order_pk = late_capture
+            try:
+                client.payment.refund(transaction_id, {
+                    'amount': int(amount * 100),
+                    'notes': {'order_id': str(order_pk), 'reason': 'Capture after order cancellation'},
+                })
+            except Exception:
+                logger.exception("Late capture refund failed for order %s", order_pk)
+                Payment.objects.filter(pk=payment_pk, status='refund_pending').update(status='refund_failed')
 
         return HttpResponse(status=200)
     return HttpResponse(status=405)

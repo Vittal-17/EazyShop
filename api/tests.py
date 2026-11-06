@@ -9,7 +9,8 @@ from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from rest_framework import serializers, status
+from django.utils import timezone
+from rest_framework import status
 from rest_framework.test import APITestCase
 import razorpay
 
@@ -29,7 +30,16 @@ from .models import (
     User,
     WalletTransaction,
 )
-from .serializers import OrderSerializer, UserProfileUpdateSerializer, UserSerializer
+from .fulfillment import fulfill_order
+from .serializers import UserProfileUpdateSerializer, UserSerializer
+
+
+def historical_order(**fields):
+    return Order.objects.bulk_create([Order(**fields)])[0]
+
+
+def historical_order_item(**fields):
+    return OrderItem.objects.bulk_create([OrderItem(**fields)])[0]
 
 
 class UserPrivilegeRegressionTests(APITestCase):
@@ -561,42 +571,63 @@ class EazyShopTitaniumTestSuite(APITestCase):
     # ==========================================
     # PHASE 5: CHECKOUT & MATHEMATICS
     # ==========================================
+    def _mock_checkout_gateway(self):
+        gateway = self.enterContext(patch('razorpay.Client')).return_value
+        gateway.order.create.return_value = {'id': 'fixture_order', 'amount': 100000, 'currency': 'INR'}
+        return gateway
+
+    def _settle_fixture(self, order):
+        Payment.objects.create(
+            order=order, transaction_id=f'fixture-{order.pk}', amount=order.total_price,
+            status='completed', verified_at=timezone.now(),
+        )
+        order.status = 'paid'
+        order.save(update_fields=['status'])
+
+    def _fund_wallet(self, amount):
+        self.customer.wallet_balance = Decimal(amount)
+        self.customer.save(update_fields=['wallet_balance'])
+
     def test_20_checkout_success(self):
+        self._mock_checkout_gateway()
         self.client.force_authenticate(user=self.customer)
         payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 1}]}
-        response = self.client.post(self.order_url, payload, format='json')
+        response = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     def test_21_checkout_missing_address_fails(self):
         self.client.force_authenticate(user=self.customer)
         payload = {"order_items": [{"product": self.product.id, "quantity": 1}]}
-        response = self.client.post(self.order_url, payload, format='json')
+        response = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_22_checkout_zero_quantity_fails(self):
         self.client.force_authenticate(user=self.customer)
         payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 0}]}
-        response = self.client.post(self.order_url, payload, format='json')
+        response = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_23_malicious_pricing_ignored(self):
+        self._mock_checkout_gateway()
         self.client.force_authenticate(user=self.customer)
         payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 2, "price": 0.01}]}
-        response = self.client.post(self.order_url, payload, format='json')
-        self.assertEqual(float(response.data['total_price']), 2000.00)
+        response = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
+        self.assertEqual(Order.objects.get(pk=response.data['order_id']).total_price, 2000.00)
 
     def test_24_checkout_decrements_stock(self):
+        self._mock_checkout_gateway()
         self.client.force_authenticate(user=self.customer)
         payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 2}]}
-        self.client.post(self.order_url, payload, format='json')
+        self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 3)
 
     def test_25_checkout_clears_cart(self):
+        self._fund_wallet("5000.00")
         self.client.force_authenticate(user=self.customer)
         CartItem.objects.create(cart=self.cart, product=self.product, quantity=1)
-        payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 1}]}
-        self.client.post(self.order_url, payload, format='json')
+        payload = {"use_wallet": True, "shipping_address": "123", "contact_phone": "123", "order_items": [{"product": self.product.id, "quantity": 1}]}
+        self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         self.assertEqual(CartItem.objects.filter(cart=self.cart).count(), 0)
 
     # ==========================================
@@ -614,12 +645,17 @@ class EazyShopTitaniumTestSuite(APITestCase):
     def test_27_admin_can_update_status(self):
         self.client.force_authenticate(user=self.admin)
         order = Order.objects.create(user=self.customer, total_price=1000)
+        OrderItem.objects.create(order=order, price=1000)
+        self._settle_fixture(order)
         response = self.client.patch(f'/api/orders/{order.id}/', {"status": "shipped"}, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_28_customer_cannot_cancel_shipped_order(self):
         self.client.force_authenticate(user=self.customer)
-        order = Order.objects.create(user=self.customer, total_price=1000, status="shipped")
+        order = Order.objects.create(user=self.customer, total_price=1000)
+        OrderItem.objects.create(order=order, price=1000)
+        self._settle_fixture(order)
+        fulfill_order(order.pk, 'shipped')
         response = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -775,9 +811,10 @@ class EazyShopTitaniumTestSuite(APITestCase):
     def test_47_automated_revenue_splitting(self):
         approved_prod = Product.objects.create(name="Seller Item", price=100.00, stock=5, vendor=self.seller, approval_status='approved', is_active=True)
 
+        self._mock_checkout_gateway()
         self.client.force_authenticate(user=self.customer)
         payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": approved_prod.id, "quantity": 2}]}
-        self.client.post(self.order_url, payload, format='json')
+        self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
 
         order_item = OrderItem.objects.get(product=approved_prod)
         self.assertEqual(float(order_item.platform_fee), 20.00)
@@ -791,8 +828,9 @@ class EazyShopTitaniumTestSuite(APITestCase):
         approved_prod = Product.objects.create(name="Vendor Fulfillment Item", price=50.00, stock=5, vendor=self.seller, approval_status='approved', is_active=True)
 
             # 🚀 FIX: Use our custom endpoint that properly maps the vendor to the OrderItem
+        self._fund_wallet("5000.00")
         self.client.force_authenticate(user=self.customer)
-        payload = {"shipping_address": "123", "contact_phone": "123", "total_price": "50.00", "order_items": [{"product": approved_prod.id, "quantity": 1, "price": "50.00"}]}
+        payload = {"use_wallet": True, "shipping_address": "123", "contact_phone": "123", "total_price": "50.00", "order_items": [{"product": approved_prod.id, "quantity": 1, "price": "50.00"}]}
         res = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
         order_id = res.data['order_id']
 
@@ -805,10 +843,11 @@ class EazyShopTitaniumTestSuite(APITestCase):
         other_seller = User.objects.create_user(username="rivalseller", email="rival@test.com", password="password123", role="seller")
         approved_prod = Product.objects.create(name="Rival Item", price=50.00, stock=5, vendor=self.seller, approval_status='approved', is_active=True)
 
+        self._fund_wallet("5000.00")
         self.client.force_authenticate(user=self.customer)
-        payload = {"shipping_address": "123", "contact_phone": "123", "order_items": [{"product": approved_prod.id, "quantity": 1}]}
-        res = self.client.post(self.order_url, payload, format='json')
-        order_item = OrderItem.objects.get(order_id=res.data['id'])
+        payload = {"use_wallet": True, "shipping_address": "123", "contact_phone": "123", "order_items": [{"product": approved_prod.id, "quantity": 1}]}
+        res = self.client.post(self.order_url + 'create-razorpay-order/', payload, format='json')
+        order_item = OrderItem.objects.get(order_id=res.data['order_id'])
 
         self.client.force_authenticate(user=other_seller)
         response = self.client.patch(f'/api/vendor-sales/{order_item.id}/update_status/', {"status": "shipped"}, format='json')
@@ -864,12 +903,13 @@ class EazyShopTitaniumTestSuite(APITestCase):
     @patch('razorpay.Client')
     def test_52_verify_razorpay_payment_success(self, MockRazorpayClient, MockEmail):
         CartItem.objects.create(cart=self.cart, product=self.product, quantity=1)
-        order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment')
+        order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
 
+        OrderItem.objects.create(order=order, product=self.product, price=1000)
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_payment_signature.return_value = None
         mock_client.payment.fetch.return_value = {
-            'id': 'pay_rzp123',
+            'id': 'pay_rzp123', 'order_id': 'order_rzp123', 'currency': 'INR',
             'status': 'captured',
             'method': 'upi',
             'amount': 100000,  # ₹1000.00 in paise
@@ -897,11 +937,11 @@ class EazyShopTitaniumTestSuite(APITestCase):
 
     @patch('razorpay.Client')
     def test_53_verify_razorpay_payment_invalid_signature(self, MockRazorpayClient):
-        order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment')
+        order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
 
         mock_client = MockRazorpayClient.return_value
         mock_client.payment.fetch.return_value = {
-            'id': 'pay_rzp123',
+            'id': 'pay_rzp123', 'order_id': 'order_rzp123', 'currency': 'INR',
             'status': 'captured',
             'method': 'card',
             'amount': 100000,
@@ -921,13 +961,13 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.assertFalse(Payment.objects.filter(transaction_id="pay_rzp123").exists())
 
     @patch('razorpay.Client')
-    def test_54_webhook_payment_captured_revives_cancelled_order(self, MockRazorpayClient):
-        order = Order.objects.create(user=self.customer, total_price=1000, status='cancelled')
+    def test_54_webhook_payment_captured_does_not_revive_cancelled_order(self, MockRazorpayClient):
+        order = Order.objects.create(user=self.customer, total_price=1000, status='cancelled', gateway_order_id='fixture_late')
         OrderItem.objects.create(order=order, product=self.product, quantity=2, price=1000, status='cancelled')
 
         payload = {
                 "event": "payment.captured",
-                "payload": {"payment": {"entity": {"id": "pay_retry123", "method": "netbanking", "notes": {"django_order_id": order.id}}}}
+                "payload": {"payment": {"entity": {"id": "pay_retry123", "method": "netbanking", "order_id": "fixture_late", "amount": 100000, "currency": "INR", "status": "captured", "notes": {"django_order_id": order.id}}}}
             }
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_webhook_signature.return_value = None
@@ -936,14 +976,18 @@ class EazyShopTitaniumTestSuite(APITestCase):
         response = self.client.post('/api/webhooks/razorpay/', json.dumps(payload), content_type='application/json', HTTP_X_RAZORPAY_SIGNATURE='valid_sig')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+        order.refresh_from_db()
+        self.assertEqual(order.status, "cancelled")
+        mock_client.payment.refund.assert_called_once()
+
     @patch('razorpay.Client')
     def test_55_webhook_payment_failed_cancels_order(self, MockRazorpayClient):
-        order = Order.objects.create(user=self.customer, total_price=1000, status='pending')
+        order = Order.objects.create(user=self.customer, total_price=1000, status='pending', gateway_order_id='fixture_failed')
         OrderItem.objects.create(order=order, product=self.product, quantity=1, price=1000, status='pending')
 
         payload = {
                 "event": "payment.failed",
-                "payload": {"payment": {"entity": {"notes": {"django_order_id": order.id}}}}
+                "payload": {"payment": {"entity": {"order_id": "fixture_failed"}}}
             }
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_webhook_signature.return_value = None
@@ -951,6 +995,9 @@ class EazyShopTitaniumTestSuite(APITestCase):
             # 🚀 FIX: Removed the trailing slash to prevent 301 Redirects
         response = self.client.post('/api/webhooks/razorpay/', json.dumps(payload), content_type='application/json', HTTP_X_RAZORPAY_SIGNATURE='valid_sig')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, "cancelled")
 
     # ==========================================
     # PHASE 14: HTTP-ONLY COOKIES & JWT SECURITY
@@ -1169,13 +1216,22 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.customer.save()
 
         CartItem.objects.create(cart=self.cart, product=self.product, quantity=1)
-        order = Order.objects.create(user=self.customer, total_price=1000, status='pending')
+        self.client.force_authenticate(self.customer)
+        MockRazorpayClient.return_value.order.create.return_value = {
+            'id': 'order_rzp123', 'currency': 'INR', 'amount': 60000,
+        }
+        checkout = self.client.post(self.order_url + 'create-razorpay-order/', {
+            'shipping_address': 'Fixture', 'contact_phone': '1234', 'use_wallet': True,
+            'order_items': [{'product': self.product.pk, 'quantity': 1}],
+        }, format='json')
+        self.assertEqual(checkout.status_code, 201)
+        order = Order.objects.get(pk=checkout.data['order_id'])
 
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_payment_signature.return_value = None
         # Mocking the Razorpay notes payload holding the split deduction
         mock_client.payment.fetch.return_value = {
-            'id': 'pay_rzp123',
+            'id': 'pay_rzp123', 'order_id': 'order_rzp123', 'currency': 'INR',
             'status': 'captured',
             'method': 'upi',
             'amount': 60000,  # ₹600.00 gateway leg (₹1000 total - ₹400 wallet)
@@ -1202,12 +1258,12 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.customer.wallet_balance = Decimal('100.00') # Less than the 400 requested deduction
         self.customer.save()
 
-        order = Order.objects.create(user=self.customer, total_price=1000, status='pending')
+        order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
 
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_payment_signature.return_value = None
         mock_client.payment.fetch.return_value = {
-            'id': 'pay_rzp123',
+            'id': 'pay_rzp123', 'order_id': 'order_rzp123', 'currency': 'INR',
             'status': 'captured',
             'method': 'upi',
             'amount': 60000,  # ₹600.00 gateway leg (₹1000 total - ₹400 wallet)
@@ -1225,7 +1281,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
 
         # Due to our atomic wallet reservation, this should fail and the wallet must be restored
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('wallet reserve', response.data['message'])
+        self.assertIn('order balance', response.data['message'])
         self.customer.refresh_from_db()
         self.assertEqual(self.customer.wallet_balance, Decimal('100.00'))  # reserve rolled back
 
@@ -1293,9 +1349,10 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.assertEqual(len(response_filtered.data), 0)
 
     def test_70_order_items_vendor_sees_sold_items(self):
-        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='completed')
+        order_cust = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment')
         item_cust = OrderItem.objects.create(order=order_cust, product=self.product, quantity=1, price=1000, vendor=self.seller)
 
+        self._settle_fixture(order_cust)
         self.client.force_authenticate(user=self.seller)
         response = self.client.get('/api/order-items/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -1445,6 +1502,10 @@ class Phase19FinancialSecurityTests(APITestCase):
 
     def test_fin01_negative_price_fails(self):
         self.client.force_authenticate(user=self.customer)
+        gateway = self.enterContext(patch('razorpay.Client')).return_value
+        gateway.order.create.side_effect = [
+            {'id': f'fixture-{index}', 'amount': 100000, 'currency': 'INR'} for index in range(3)
+        ]
         for total in ("-1000.00", "0.00", "-1.00"):
             res = self.client.post(self.order_url, {
                 "shipping_address": "addr", "contact_phone": "111",
@@ -1533,37 +1594,21 @@ class Phase2HardeningTests(APITestCase):
         self.assertEqual(res_correct.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
     def test_fin12_order_state_machine_validation(self):
-        # 1. Terminal state protection: delivered cannot be rewound to pending
-        order = Order.objects.create(user=self.customer, total_price=500, status='delivered')
+
+        order = Order.objects.create(user=self.customer, total_price=500, status='pending_payment')
+        OrderItem.objects.create(order=order, price=500)
+        order.status = 'paid'
+        with self.assertRaises(ValidationError):
+            order.save(update_fields=['status'])
+        Payment.objects.create(order=order, transaction_id='lifecycle-capture', amount=500,
+                               status='completed', verified_at=timezone.now())
+        order.save(update_fields=['status'])
+        fulfill_order(order.pk, 'shipped')
+        order, _ = fulfill_order(order.pk, 'delivered')
+        self.assertEqual(order.status, 'delivered')
         order.status = 'pending'
         with self.assertRaises(ValidationError):
-            order.save()
-
-        # 2. Payment bypass protection: pending_payment cannot jump directly to delivered
-        unpaid_order = Order.objects.create(user=self.customer, total_price=500, status='pending_payment')
-        unpaid_order.status = 'delivered'
-        with self.assertRaises(ValidationError):
-            unpaid_order.save()
-
-        # 3. Legitimate enterprise lifecycle: pending_payment -> paid -> processing -> shipped -> delivered
-        lifecycle_order = Order.objects.create(user=self.customer, total_price=500, status='pending_payment')
-
-        lifecycle_order.status = 'paid'
-        lifecycle_order.save()
-        self.assertEqual(lifecycle_order.status, 'paid')
-
-        lifecycle_order.status = 'processing'
-        lifecycle_order.save()
-        self.assertEqual(lifecycle_order.status, 'processing')
-
-        lifecycle_order.status = 'shipped'
-        lifecycle_order.save()
-        self.assertEqual(lifecycle_order.status, 'shipped')
-
-        lifecycle_order.status = 'delivered'
-        lifecycle_order.save()
-        lifecycle_order.refresh_from_db()
-        self.assertEqual(lifecycle_order.status, 'delivered')
+            order.save(update_fields=['status'])
 
     def test_sec06_cookie_csrf_protection(self):
         from rest_framework_simplejwt.tokens import AccessToken
@@ -1610,7 +1655,7 @@ class Phase2HardeningTests(APITestCase):
             'currency': 'INR'
         }
         mock_client.payment.fetch.return_value = {
-            'id': 'pay_split_123',
+            'id': 'pay_split_123', 'order_id': 'order_split_rzp', 'currency': 'INR',
             'status': 'captured',
             'method': 'upi',
             'amount': 30000,  # ₹300.00 gateway leg (₹500 total - ₹200 wallet)
@@ -1801,11 +1846,11 @@ class Phase2HardeningTests(APITestCase):
     def test_sec03_fin04_payment_viewset_readonly_and_ownership_scoped(self):
         """SEC-03 / FIN-04: PaymentViewSet is ReadOnly and scoped to owner/admin."""
         # Create an order and payment for customer
-        order_cust = Order.objects.create(user=self.customer, total_price=Decimal('100.00'), status='paid')
+        order_cust = historical_order(user=self.customer, total_price=Decimal('100.00'), status='paid')
         pay_cust = Payment.objects.create(order=order_cust, amount=Decimal('100.00'), transaction_id='TXN_CUST_1', status='completed')
 
         # Create an order and payment for hacker
-        order_hack = Order.objects.create(user=self.hacker, total_price=Decimal('200.00'), status='paid')
+        order_hack = historical_order(user=self.hacker, total_price=Decimal('200.00'), status='paid')
         pay_hack = Payment.objects.create(order=order_hack, amount=Decimal('200.00'), transaction_id='TXN_HACK_1', status='completed')
 
         # 1. Customer cannot POST to create fake payments -> 405 Method Not Allowed
@@ -1866,22 +1911,12 @@ class Phase2HardeningTests(APITestCase):
         res_admin_post = self.client.post('/api/categories/', {'name': 'Admin Approved Cat'}, format='json')
         self.assertEqual(res_admin_post.status_code, status.HTTP_201_CREATED)
 
-    def test_sec12_order_viewset_destroy_restricted_to_admin(self):
-        """SEC-12: Non-admin users cannot delete orders."""
+    def test_sec12_order_viewset_has_no_delete_action(self):
         order = Order.objects.create(user=self.customer, total_price=Decimal('50.00'), status='pending')
-
-        # 1. Customer attempting DELETE -> 403 Forbidden
-        self.client.force_authenticate(user=self.customer)
-        res_cust_del = self.client.delete(f'/api/orders/{order.id}/')
-        self.assertEqual(res_cust_del.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertIn('restricted to administrators', res_cust_del.data['error'])
+        for actor in (self.customer, self.admin):
+            self.client.force_authenticate(actor)
+            self.assertEqual(self.client.delete(f'/api/orders/{order.id}/').status_code, 405)
         self.assertTrue(Order.objects.filter(id=order.id).exists())
-
-        # 2. Admin attempting DELETE -> 204 No Content
-        self.client.force_authenticate(user=self.admin)
-        res_admin_del = self.client.delete(f'/api/orders/{order.id}/')
-        self.assertEqual(res_admin_del.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Order.objects.filter(id=order.id).exists())
 
 
 # ==========================================
@@ -2041,7 +2076,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_failed_123",
+                        "id": "pay_failed_123", "order_id": "rzp_order_fail_test",
                         "notes": {"django_order_id": order.id}
                     }
                 }
@@ -2079,8 +2114,8 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 10)  # Still exactly 10!
 
-    def test_blocker4_order_serializer_deterministic_locking_and_stock_validation(self):
-        """BLOCKER 4: OrderSerializer.create locks items in sorted order, validates stock & active status."""
+    def test_blocker4_checkout_deterministic_locking_and_stock_validation(self):
+        """BLOCKER 4: Checkout locks items in sorted order, validates stock & active status."""
         p_alpha = Product.objects.create(
             name="Alpha Item", price=Decimal('40.00'), stock=5,
             category=self.category, vendor=self.seller, approval_status='approved', is_active=True
@@ -2090,18 +2125,23 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             category=self.category, vendor=self.seller, approval_status='approved', is_active=True
         )
 
-        serializer = OrderSerializer(context={'request': MagicMock(user=self.customer)})
+        self.client.force_authenticate(self.customer)
+        gateway = self.enterContext(patch('razorpay.Client')).return_value
+        gateway.order.create.return_value = {'id': 'order_stock_test', 'amount': 24000, 'currency': 'INR'}
+        url = '/api/orders/create-razorpay-order/'
 
         # 1. Provide items in reverse order [p_beta, p_alpha]
         order_data = {
             'shipping_address': 'Reverse Lock Street',
             'contact_phone': '9998887776',
             'order_items': [
-                {'product': p_beta, 'quantity': 2},
-                {'product': p_alpha, 'quantity': 3},
+                {'product': p_beta.pk, 'quantity': 2},
+                {'product': p_alpha.pk, 'quantity': 3},
             ]
         }
-        order = serializer.create(order_data)
+        response = self.client.post(url, order_data, format='json')
+        self.assertEqual(response.status_code, 201)
+        order = Order.objects.get(pk=response.data['order_id'])
         self.assertEqual(order.total_price, Decimal('240.00'))  # (60*2) + (40*3) = 120 + 120 = 240
 
         p_alpha.refresh_from_db()
@@ -2109,18 +2149,17 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         self.assertEqual(p_alpha.stock, 2)  # 5 - 3 = 2
         self.assertEqual(p_beta.stock, 1)   # 3 - 2 = 1
 
-        # 2. Exceeding stock raises serializers.ValidationError
+        # 2. Exceeding stock returns HTTP 400
         insufficient_data = {
             'shipping_address': 'Exceed Street',
             'contact_phone': '9998887776',
             'order_items': [
-                {'product': p_beta, 'quantity': 5},  # only 1 left
+                {'product': p_beta.pk, 'quantity': 5},  # only 1 left
             ]
         }
-        with self.assertRaises(serializers.ValidationError):
-            serializer.create(insufficient_data)
+        self.assertEqual(self.client.post(url, insufficient_data, format='json').status_code, 400)
 
-        # 3. Inactive product raises serializers.ValidationError
+        # 3. Inactive product returns HTTP 400
         p_inactive = Product.objects.create(
             name="Inactive Item", price=Decimal('10.00'), stock=5,
             category=self.category, vendor=self.seller, approval_status='approved', is_active=False
@@ -2129,11 +2168,10 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             'shipping_address': 'Inactive Street',
             'contact_phone': '9998887776',
             'order_items': [
-                {'product': p_inactive, 'quantity': 1},
+                {'product': p_inactive.pk, 'quantity': 1},
             ]
         }
-        with self.assertRaises(serializers.ValidationError):
-            serializer.create(inactive_data)
+        self.assertEqual(self.client.post(url, inactive_data, format='json').status_code, 400)
 
     def test_blocker5_idempotency_key_replay_and_in_flight_lock(self):
         """
@@ -2151,7 +2189,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         with patch('razorpay.Client') as m:
             m.return_value.order.create.return_value = {
                 'id': 'rzp_order_idem_test',
-                'amount': 100000,
+                'amount': 5000,
                 'currency': 'INR'
             }
             res1 = self.client.post(
@@ -2209,9 +2247,9 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         # 4. verify-razorpay-payment idempotency replay
         with patch('razorpay.Client') as m_rzp:
             m_rzp.return_value.payment.fetch.return_value = {
-                'id': 'pay_verify_idem_1',
+                'id': 'pay_verify_idem_1', 'order_id': 'rzp_order_idem_test', 'currency': 'INR',
                 'status': 'captured',
-                'amount': 100000,
+                'amount': 5000,
                 'method': 'card',
                 'notes': {}
             }
@@ -2278,7 +2316,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         self.assertEqual(res['Content-Type'], 'application/pdf')
 
         # 2. Paid / Processing order -> "Paid & Verified"
-        order_paid = Order.objects.create(
+        order_paid = historical_order(
             user=self.customer, total_price=Decimal('500.00'), status='processing',
             shipping_address='Street 2', contact_phone='1234567890'
         )
@@ -2336,11 +2374,11 @@ class PhaseAFinancialIntegrityTests(APITestCase):
 
         # 1. Order cancellation triggers Razorpay refund API
         self.client.force_authenticate(user=self.customer)
-        order = Order.objects.create(
+        order = historical_order(
             user=self.customer, total_price=Decimal('100.00'), status='processing',
             shipping_address='Refund Street', contact_phone='9990001112'
         )
-        item = OrderItem.objects.create(
+        item = historical_order_item(
             order=order, product=self.product, vendor=self.seller, quantity=1, price=Decimal('100.00')
         )
         pay_gateway = Payment.objects.create(
@@ -2366,14 +2404,14 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         # 2. Webhook: payment.authorized
         order_auth = Order.objects.create(
             user=self.customer, total_price=Decimal('150.00'), status='pending_payment',
-            shipping_address='Auth Street', contact_phone='9990001112'
+            gateway_order_id='order_auth_fixture', shipping_address='Auth Street', contact_phone='9990001112'
         )
         auth_payload = {
             "event": "payment.authorized",
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_auth_test_999",
+                        "id": "pay_auth_test_999", "order_id": "order_auth_fixture",
                         "amount": 15000,
                         "method": "upi",
                         "notes": {"django_order_id": order_auth.id}
@@ -2396,7 +2434,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         # 3. Webhook: order.paid
         order_to_pay = Order.objects.create(
             user=self.customer, total_price=Decimal('200.00'), status='pending_payment',
-            shipping_address='Paid Street', contact_phone='9990001112'
+            gateway_order_id='order_rzp_paid_123', shipping_address='Paid Street', contact_phone='9990001112'
         )
         OrderItem.objects.create(
             order=order_to_pay, product=self.product, vendor=self.seller, quantity=1, price=Decimal('200.00')
@@ -2404,6 +2442,10 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         paid_payload = {
             "event": "order.paid",
             "payload": {
+                "payment": {"entity": {
+                    "id": "pay_order_paid", "order_id": "order_rzp_paid_123",
+                    "amount": 20000, "currency": "INR", "status": "captured",
+                }},
                 "order": {
                     "entity": {
                         "id": "order_rzp_paid_123",
@@ -2423,11 +2465,11 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         self.assertEqual(order_to_pay.status, 'paid')
 
         # 4. Webhook: refund.processed
-        order_refund = Order.objects.create(
+        order_refund = historical_order(
             user=self.customer, total_price=Decimal('50.00'), status='paid',
             shipping_address='Refund Hook Street', contact_phone='9990001112'
         )
-        OrderItem.objects.create(
+        historical_order_item(
             order=order_refund, product=self.product, vendor=self.seller, quantity=1, price=Decimal('50.00')
         )
         pay_completed = Payment.objects.create(
@@ -2890,12 +2932,12 @@ class PhaseABHardeningRefinementTests(APITestCase):
             stock=10,
             category=self.category
         )
-        self.order = Order.objects.create(
+        self.order = historical_order(
             user=self.user,
             total_price=Decimal('150.00'),
             status='paid'
         )
-        self.order_item = OrderItem.objects.create(
+        self.order_item = historical_order_item(
             order=self.order,
             product=self.product,
             quantity=1,
@@ -2983,47 +3025,44 @@ class PhaseABHardeningRefinementTests(APITestCase):
     def test_refinement03_deterministic_lock_ordering(self):
         """
         REFINEMENT 3: Deterministic PostgreSQL Row-Lock Ordering
-        Verifies that multi-item queries in OrderSerializer.create and create_razorpay_order
+        Verifies that multi-item queries in create_razorpay_order
         explicitly chain .order_by('id') to override Product.Meta.ordering = ['-created_at'],
-        guaranteeing strict ascending ID acquisition and absolute deadlock immunity.
+        so competing product locks are acquired in ascending order.
         """
         from api.models import Product
-        from api.serializers import OrderSerializer
 
         # 1. SQL query inspection: assert explicit ORDER BY id is present
         sorted_ids = [10, 5, 20]
         qs = Product.objects.select_for_update().filter(id__in=sorted_ids).order_by('id')
         sql_str = str(qs.query)
         self.assertIn('ORDER BY "api_product"."id" ASC', sql_str,
-                      "Query must explicitly order by id ASC to guarantee deadlock immunity across concurrent workers")
+                      "Query must explicitly order by id ASC for consistent product locking across workers")
 
-        # 2. End-to-end checkout with out-of-order products in OrderSerializer
+        # 2. End-to-end checkout with out-of-order products through the API
         prod_a = Product.objects.create(name="Product A", price=Decimal('20.00'), stock=10, category=self.category, approval_status='approved')
         prod_b = Product.objects.create(name="Product B", price=Decimal('30.00'), stock=10, category=self.category, approval_status='approved')
 
         # Reverse order in payload: [prod_b, prod_a]
         payload = {
             'order_items': [
-                {'product': prod_b, 'quantity': 2},
-                {'product': prod_a, 'quantity': 1}
+                {'product': prod_b.pk, 'quantity': 2},
+                {'product': prod_a.pk, 'quantity': 1}
             ],
             'shipping_address': '123 Enterprise Blvd',
             'contact_phone': '9876543210'
         }
-        serializer = OrderSerializer(context={'request': type('Req', (), {'user': self.user})()})
-        order = serializer.create(payload)
+        self.client.force_authenticate(self.user)
+        gateway = self.enterContext(patch('razorpay.Client')).return_value
+        gateway.order.create.return_value = {'id': 'order_sort_fixture', 'amount': 8000, 'currency': 'INR'}
+        response = self.client.post('/api/orders/create-razorpay-order/', payload, format='json')
+        self.assertEqual(response.status_code, 201)
+        order = Order.objects.get(pk=response.data['order_id'])
         self.assertEqual(order.total_price, Decimal('80.00'))
         self.assertEqual(order.order_items.count(), 2)
 
     @patch('razorpay.Client')
-    def test_refinement04_webhook_revival_overselling_guard(self, MockRazorpayClient):
-        """
-        REFINEMENT 4: Webhook Order Revival Stock Availability Guard
-        Verifies that when a payment.captured webhook arrives for a cancelled order:
-        - If stock is insufficient (re-sold while cancelled), the order remains cancelled,
-          stock never goes negative, and an automated gateway refund is triggered.
-        - If stock is sufficient, the order is safely revived and stock decremented.
-        """
+    def test_refinement04_late_capture_does_not_reopen_cancelled_order(self, MockRazorpayClient):
+        """Late captures initiate refunds without reopening cancelled orders."""
         import json
         from api.models import Product, Order, OrderItem, Payment
 
@@ -3041,7 +3080,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
         cancelled_order = Order.objects.create(
             user=self.user,
             total_price=Decimal('200.00'),
-            status='cancelled'
+            status='cancelled', gateway_order_id='late-depleted'
         )
         OrderItem.objects.create(
             order=cancelled_order,
@@ -3056,7 +3095,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_revival_depleted_1",
+                        "id": "pay_revival_depleted_1", "order_id": "late-depleted", "currency": "INR", "status": "captured",
                         "amount": 20000,
                         "method": "card",
                         "notes": {"django_order_id": cancelled_order.id}
@@ -3081,12 +3120,12 @@ class PhaseABHardeningRefinementTests(APITestCase):
         # Assert refund was called on gateway
         mock_client.payment.refund.assert_called_with('pay_revival_depleted_1', {
             'amount': 20000,
-            'notes': {'order_id': str(cancelled_order.id), 'reason': 'Auto-refund: Insufficient inventory on revival'}
+            'notes': {'order_id': str(cancelled_order.id), 'reason': 'Capture after order cancellation'}
         })
         payment_a = Payment.objects.get(transaction_id="pay_revival_depleted_1")
-        self.assertEqual(payment_a.status, 'refunded')
+        self.assertEqual(payment_a.status, 'refund_pending')
 
-        # Scenario B: Stock is sufficient (revival succeeds)
+        # Scenario B: Stock is available, but cancellation is terminal
         prod_available = Product.objects.create(
             name="Available Item",
             price=Decimal('50.00'),
@@ -3097,7 +3136,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
         cancelled_order_b = Order.objects.create(
             user=self.user,
             total_price=Decimal('100.00'),
-            status='cancelled'
+            status='cancelled', gateway_order_id='late-available'
         )
         OrderItem.objects.create(
             order=cancelled_order_b,
@@ -3112,7 +3151,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_revival_success_2",
+                        "id": "pay_revival_success_2", "order_id": "late-available", "currency": "INR", "status": "captured",
                         "amount": 10000,
                         "method": "upi",
                         "notes": {"django_order_id": cancelled_order_b.id}
@@ -3129,9 +3168,9 @@ class PhaseABHardeningRefinementTests(APITestCase):
         self.assertEqual(res_b.status_code, status.HTTP_200_OK)
 
         cancelled_order_b.refresh_from_db()
-        self.assertEqual(cancelled_order_b.status, 'paid', "Order should be safely revived to paid when stock is available")
+        self.assertEqual(cancelled_order_b.status, 'cancelled')
         prod_available.refresh_from_db()
-        self.assertEqual(prod_available.stock, 8, "Stock must be decremented by 2 (10 -> 8)")
+        self.assertEqual(prod_available.stock, 10)
 
     @patch('razorpay.Client')
     def test_refinement05_gateway_refund_failure_status(self, MockRazorpayClient):
@@ -3293,11 +3332,13 @@ class PhaseABHardeningRefinementTests(APITestCase):
         from django.db import transaction, IntegrityError
         from api.models import OrderItem
 
+        order = Order.objects.create(user=self.user, total_price=Decimal("300.00"))
+
         # 1. Direct database insert with quantity=0 MUST raise IntegrityError
         with transaction.atomic():
             with self.assertRaises(IntegrityError):
                 OrderItem.objects.create(
-                    order=self.order,
+                    order=order,
                     product=self.product,
                     quantity=0,
                     price=Decimal('100.00')
@@ -3307,7 +3348,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
         with transaction.atomic():
             with self.assertRaises(IntegrityError):
                 OrderItem.objects.create(
-                    order=self.order,
+                    order=order,
                     product=self.product,
                     quantity=-5,
                     price=Decimal('100.00')
@@ -3315,7 +3356,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
 
         # 3. Valid positive quantity inserts cleanly
         valid_item = OrderItem.objects.create(
-            order=self.order,
+            order=order,
             product=self.product,
             quantity=3,
             price=Decimal('100.00')
@@ -3404,6 +3445,10 @@ class PhaseCArchitectureScalingTests(APITestCase):
                 "order_items": [{"product": self.product.id, "quantity": 1}]
             }
 
+            gateway = self.enterContext(patch('razorpay.Client')).return_value
+            gateway.order.create.side_effect = [
+                {'id': f'throttle-{index}', 'amount': 9999, 'currency': 'INR'} for index in range(2)
+            ]
             for i in range(2):
                 res_checkout = self.client.post('/api/orders/create-razorpay-order/', order_payload, format='json')
                 self.assertNotEqual(res_checkout.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
@@ -3582,14 +3627,14 @@ class PhaseCArchitectureScalingTests(APITestCase):
         cache.clear()
         self.client.force_authenticate(user=self.user)
 
-        order = Order.objects.create(
+        order = historical_order(
             user=self.user,
             total_price=Decimal('199.98'),
             status='paid',
             shipping_address='789 Cache Lane',
             contact_phone='9998887776'
         )
-        OrderItem.objects.create(
+        historical_order_item(
             order=order,
             product=self.product,
             quantity=2,
@@ -3767,14 +3812,14 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
         self.client.force_authenticate(user=self.user)
         initial_stock = self.product.stock
 
-        order = Order.objects.create(
+        order = historical_order(
             user=self.user,
             total_price=Decimal('100.00'),
             status='processing',
             shipping_address='Cancel Test St',
             contact_phone='1234567890'
         )
-        item = OrderItem.objects.create(
+        item = historical_order_item(
             order=order,
             product=self.product,
             quantity=2,
@@ -3809,7 +3854,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
     def test_refinement04_webhook_deterministic_product_locking(self, mock_client_cls):
         """
         ADV-FIN-02: Verify deterministic ascending lock ordering in razorpay_webhook
-        for order revival, refund, and payment.failed events.
+        for a refund after a bound capture.
         """
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
@@ -3831,39 +3876,39 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
             approval_status='approved'
         )
         prod_low, prod_high = (p1, p2) if p1.id < p2.id else (p2, p1)
-        prod_high.stock = 15
+        prod_high.stock = 12
         prod_high.save(update_fields=['stock'])
-        prod_low.stock = 10
+        prod_low.stock = 8
         prod_low.save(update_fields=['stock'])
 
-        # Create a cancelled order with items inserted in descending ID order (prod_high first, then prod_low)
+        # Create an order with reserved inventory with items inserted in descending ID order (prod_high first, then prod_low)
         revival_order = Order.objects.create(
             user=self.user,
             total_price=Decimal('200.00'),
-            status='cancelled'
+            status='pending_payment', gateway_order_id='bound-multi'
         )
         OrderItem.objects.create(
             order=revival_order,
             product=prod_high,
             quantity=3,
             price=prod_high.price,
-            status='cancelled'
+            status='pending'
         )
         OrderItem.objects.create(
             order=revival_order,
             product=prod_low,
             quantity=2,
             price=prod_low.price,
-            status='cancelled'
+            status='pending'
         )
 
-        # Trigger revival via payment.captured
+        # Finalize via payment.captured
         payload = {
             "event": "payment.captured",
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_revival_deterministic_1",
+                        "id": "pay_revival_deterministic_1", "order_id": "bound-multi", "currency": "INR", "status": "captured",
                         "amount": 20000,
                         "method": "card",
                         "notes": {"django_order_id": revival_order.id}
@@ -3879,15 +3924,15 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
         )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
 
-        # Assert revival succeeded
+        # Assert capture succeeded
         revival_order.refresh_from_db()
         self.assertEqual(revival_order.status, 'paid')
         prod_high.refresh_from_db()
-        self.assertEqual(prod_high.stock, 12, "High product stock should be decremented by 3")
+        self.assertEqual(prod_high.stock, 12, "High product must stay reserved")
         prod_low.refresh_from_db()
-        self.assertEqual(prod_low.stock, 8, "Low product stock should be decremented by 2")
+        self.assertEqual(prod_low.stock, 8, "Low product must stay reserved")
 
-        # Now test refund.processed on this revived order
+        # Now test refund.processed on this settled order
         refund_payload = {
             "event": "refund.processed",
             "payload": {
