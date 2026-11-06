@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
@@ -31,6 +32,12 @@ class User(AbstractUser):
         indexes = [
             models.Index(fields=['email']),
             models.Index(fields=['role']),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(wallet_balance__gte=Decimal('0.00')),
+                name='user_wallet_balance_gte_0'
+            )
         ]
 
     def __str__(self):
@@ -94,6 +101,16 @@ class Product(models.Model):
             models.Index(fields=['category']),
             models.Index(fields=['price']),
             models.Index(fields=['created_at']),
+            models.Index(fields=['is_active', 'approval_status', '-created_at'], name='product_catalog_idx'),
+            models.Index(fields=['category', 'is_active', 'approval_status'], name='product_cat_status_idx'),
+            models.Index(fields=['vendor', 'approval_status'], name='product_vendor_status_idx'),
+            models.Index(fields=['category', 'price'], name='product_cat_price_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(stock__gte=0),
+                name='product_stock_gte_0'
+            )
         ]
 
     def __str__(self):
@@ -131,6 +148,9 @@ class CartItem(models.Model):
 class Order(models.Model):
     STATUS_CHOICES = (
         ('pending', 'Pending'),
+        ('pending_payment', 'Pending Payment'),
+        ('paid', 'Paid'),
+        ('processing', 'Processing'),
         ('shipped', 'Shipped'),
         ('delivered', 'Delivered'),
         ('cancelled', 'Cancelled')
@@ -150,8 +170,39 @@ class Order(models.Model):
             models.Index(fields=['created_at']),
         ]
 
-    def __str__(self):
-        return f"Order #{self.id} by {self.user.username}"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._original_status = self.status
+
+    def clean(self):
+        super().clean()
+        if self.pk:
+            old_status = getattr(self, '_original_status', None)
+            if old_status is None:
+                try:
+                    old_status = Order.objects.filter(pk=self.pk).values_list('status', flat=True).first()
+                except Exception:
+                    old_status = None
+
+            new_status = self.status
+            if old_status and old_status != new_status:
+                allowed_transitions = {
+                    'pending': ['pending_payment', 'paid', 'processing', 'shipped', 'cancelled'],
+                    'pending_payment': ['pending', 'paid', 'processing', 'shipped', 'cancelled'],
+                    'paid': ['processing', 'shipped', 'cancelled'],
+                    'processing': ['shipped', 'delivered', 'cancelled'],
+                    'shipped': ['delivered', 'cancelled'],
+                    'delivered': [],
+                    'cancelled': ['pending', 'pending_payment', 'paid', 'processing'],
+                }
+                if new_status not in allowed_transitions.get(old_status, []):
+                    raise ValidationError(f"Invalid order status transition from '{old_status}' to '{new_status}'.")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            self.full_clean()
+        super().save(*args, **kwargs)
+        self._original_status = self.status
 
 class OrderItem(models.Model):
 
@@ -174,6 +225,14 @@ class OrderItem(models.Model):
     # The EazyShop Business Model (Platform takes 10%, Seller keeps 90%)
     platform_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     seller_earnings = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(quantity__gt=0),
+                name='order_item_quantity_gt_0'
+            )
+        ]
 
     def save(self, *args, **kwargs):
         # Auto-calculate the revenue split right before saving to the database
@@ -248,8 +307,11 @@ class Coupon(models.Model):
 class Payment(models.Model):
     STATUS_CHOICES = (
         ('pending', 'Pending'),
+        ('authorized', 'Authorized'),
         ('completed', 'Completed'),
-        ('failed', 'Failed')
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+        ('refund_failed', 'Refund Failed'),
     )
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payment')
 
@@ -313,7 +375,98 @@ class GiftCardTransaction(models.Model):
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     order = models.ForeignKey('Order', on_delete=models.SET_NULL, null=True, blank=True)
+    razorpay_payment_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
     timestamp = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"{self.transaction_type} of {self.amount} on {self.gift_card.id}"
+
+
+# ==========================================
+# WALLET AUDIT LEDGER
+# ==========================================
+class WalletTransaction(models.Model):
+    TRANSACTION_TYPES = (
+        ('CREDIT_GIFT_CARD', 'Gift Card Redemption'),
+        ('DEBIT_ORDER', 'Order Checkout'),
+        ('REFUND_ORDER', 'Order Cancellation Refund'),
+        ('ADMIN_ADJUSTMENT', 'Admin Adjustment'),
+    )
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='wallet_transactions')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=10, decimal_places=2)
+    transaction_type = models.CharField(max_length=25, choices=TRANSACTION_TYPES)
+    reference_id = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+            models.Index(fields=['transaction_type']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.transaction_type}: {self.amount} (Balance: {self.balance_after})"
+
+
+def record_wallet_transaction(user, amount, transaction_type, reference_id=None, description=""):
+    """
+    Atomically adjust user wallet balance and insert a WalletTransaction ledger row.
+    Amount should be positive Decimal.
+    For DEBIT_ORDER, user balance is decremented by amount.
+    For CREDIT_GIFT_CARD / REFUND_ORDER / ADMIN_ADJUSTMENT, user balance is incremented by amount.
+    """
+    amount = Decimal(str(amount))
+    if amount <= Decimal('0.00'):
+        raise ValidationError("Wallet transaction amount must be strictly positive.")
+
+    if transaction_type == 'DEBIT_ORDER':
+        if user.wallet_balance < amount:
+            raise ValidationError("Insufficient wallet balance for debit.")
+        user.wallet_balance -= amount
+    elif transaction_type in ['CREDIT_GIFT_CARD', 'REFUND_ORDER', 'ADMIN_ADJUSTMENT']:
+        user.wallet_balance += amount
+    else:
+        raise ValidationError(f"Invalid transaction type: {transaction_type}")
+
+    user.save(update_fields=['wallet_balance'])
+
+    tx = WalletTransaction.objects.create(
+        user=user,
+        amount=amount,
+        balance_after=user.wallet_balance,
+        transaction_type=transaction_type,
+        reference_id=str(reference_id) if reference_id else None,
+        description=description
+    )
+    return tx
+
+
+# ==========================================
+# UNIVERSAL CACHE INVALIDATION SIGNALS
+# ==========================================
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
+from django.core.cache import cache
+
+
+@receiver([post_save, post_delete], sender=Category)
+def invalidate_category_cache_signal(sender, **kwargs):
+    """
+    ADV-ARCH-04: Universal cache invalidation for Category mutations.
+    Ensures any category create/update/delete across views, admin, management commands,
+    or direct ORM updates purges 'cache_category_list'.
+    """
+    cache.delete('cache_category_list')
+
+
+@receiver([post_save, post_delete], sender=Order)
+def invalidate_order_invoice_cache_signal(sender, instance, **kwargs):
+    """
+    ADV-ARCH-05: Universal cache invalidation for Order mutations (PDF invoices).
+    Ensures any status change or order mutation purges all cached invoice variants.
+    """
+    for s in ['pending_payment', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded', 'failed', 'paid']:
+        cache.delete(f"invoice_pdf_{instance.id}_{s}")

@@ -1,19 +1,13 @@
 // src/components/ProtectedRoute.js
-import { useContext, useEffect, useState } from 'react';
+import { useContext } from 'react';
 import { Navigate } from 'react-router-dom';
 import AuthContext from '../context/AuthContext';
 import styled, { keyframes } from 'styled-components';
 
 const ProtectedRoute = ({ children, adminOnly = false }) => {
-  const { user } = useContext(AuthContext);
-  const [checking, setChecking] = useState(true);
+  const { user, loading } = useContext(AuthContext);
 
-  useEffect(() => {
-    const timeout = setTimeout(() => setChecking(false), 1000); // faster check
-    return () => clearTimeout(timeout);
-  }, []);
-
-  if (checking) {
+  if (loading) {
     return (
       <LoadingWrapper>
         <Spinner />

@@ -4,7 +4,7 @@ import { useParams, Link } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import styled from 'styled-components';
 import AuthContext from '../context/AuthContext';
-import { toast } from "react-hot-toast"; 
+import { toast } from "react-hot-toast";
 import { FaStar, FaShoppingCart, FaArrowRight, FaCheckCircle, FaStore, FaExclamationTriangle } from 'react-icons/fa';
 import { SkeletonRow } from '../components/SkeletonLoader';
 import AppLayout from '../components/AppLayout';
@@ -17,10 +17,10 @@ const ProductDetail = () => {
 
   const [product, setProduct] = useState(null);
   const [reviews, setReviews] = useState([]);
-  
+
   const [isLoading, setIsLoading] = useState(true);
   const [reviewsLoading, setReviewsLoading] = useState(true);
-  
+
   const [reviewPage, setReviewPage] = useState(1);
   const [totalReviewPages, setTotalReviewPages] = useState(1);
   const [quantity, setQuantity] = useState(1);
@@ -31,7 +31,7 @@ const ProductDetail = () => {
     axiosInstance.get(`/api/products/${id}/`)
       .then(res => setProduct(res.data))
       .catch(err => toast.error('❌ Failed to load product.', { duration: 2000 }))
-      .finally(() => setIsLoading(false)); 
+      .finally(() => setIsLoading(false));
   }, [id, axiosInstance]);
 
   const fetchReviews = () => {
@@ -42,7 +42,7 @@ const ProductDetail = () => {
         if (res.data.count) setTotalReviewPages(Math.ceil(res.data.count / 12));
       })
       .catch(err => console.error(err))
-      .finally(() => setReviewsLoading(false)); 
+      .finally(() => setReviewsLoading(false));
   };
 
   useEffect(() => {
@@ -74,10 +74,11 @@ const ProductDetail = () => {
 
   const handleAddToCart = async () => {
     if (quantity > (product.stock || 0)) return toast.error(`Only ${product.stock} in stock!`);
-    
+
     if (user) {
       try {
         await axiosInstance.post('/api/cart-items/', { product: id, quantity });
+        window.dispatchEvent(new Event('cart-updated'));
         toast.success(t => (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span>🛒 <b>{product.name}</b> added to cart!</span>
@@ -99,6 +100,7 @@ const ProductDetail = () => {
         tempCart.push({ id: `temp_${id}`, product: id, product_name: product.name, product_image: product.image_url, price: product.price, quantity: quantity, product_stock: product.stock || 0 });
       }
       localStorage.setItem('tempCart', JSON.stringify(tempCart));
+      window.dispatchEvent(new Event('cart-updated'));
       toast.success('🛒 Added to guest cart!');
     }
   };
@@ -127,7 +129,7 @@ const ProductDetail = () => {
       <GlowingPageContainer $maxWidth="1100px">
       {/* 🚀 TOP BUY SECTION: Clean Image Pane without overlapping badge */}
       <ContentGrid>
-        <ImagePane 
+        <ImagePane
           initial={{ opacity: 0, x: -20 }}
           animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.5, type: 'spring', stiffness: 200, damping: 20 }}
@@ -135,7 +137,7 @@ const ProductDetail = () => {
           <img src={product.image_url} alt={product.name} />
         </ImagePane>
 
-        <InfoPane 
+        <InfoPane
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.5, delay: 0.1, type: 'spring', stiffness: 200, damping: 20 }}
@@ -181,10 +183,10 @@ const ProductDetail = () => {
                 <button disabled={isAtLimit} onClick={() => setQuantity(prev => Math.min(stockVal, prev + 1))} style={{ opacity: isAtLimit ? 0.4 : 1, cursor: isAtLimit ? 'not-allowed' : 'pointer' }}>+</button>
               </QuantityControl>
             </div>
-            
-            <AddToCartButton 
-              onClick={handleAddToCart} 
-              disabled={stockVal === 0} 
+
+            <AddToCartButton
+              onClick={handleAddToCart}
+              disabled={stockVal === 0}
               whileTap={{ scale: 0.98 }}
               $outOfStock={stockVal === 0}
             >
@@ -221,7 +223,7 @@ const ProductDetail = () => {
           <h2>Customer Reviews</h2>
           <div className="line"></div>
         </div>
-        
+
         {reviewsLoading ? (
            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1rem', maxWidth: '800px', margin: '0 auto' }}>
              {[...Array(2)].map((_, index) => <SkeletonRow key={index} />)}
@@ -281,7 +283,7 @@ const ContentGrid = styled.div`
 
   @media (min-width: 900px) {
     grid-template-columns: 1fr 1fr;
-    align-items: start; 
+    align-items: start;
   }
 `;
 
@@ -294,7 +296,7 @@ const ImagePane = styled(motion.div)`
   display: flex;
   align-items: center;
   justify-content: center;
-  
+
   img {
     width: 100%;
     max-width: 450px;
@@ -339,12 +341,12 @@ const PurchaseBanner = styled(motion.div)`
   padding: 1rem 1.5rem;
   border-radius: 16px;
   margin-bottom: 2rem;
-  
+
   .icon-box {
     color: #059669;
     display: flex;
   }
-  
+
   strong { color: #065F46; font-size: 0.95rem; }
   p { color: #047857; margin: 0.2rem 0 0 0; font-size: 0.85rem; font-weight: 500; }
 `;
@@ -356,7 +358,7 @@ const VendorTag = styled.div`
   color: #64748B;
   font-size: 0.95rem;
   margin-bottom: 0;
-  
+
   svg { color: #0B8457; }
   strong { color: #0F172A; }
 `;
@@ -393,7 +395,7 @@ const ActionCard = styled.div`
     align-items: center;
     margin-bottom: 1.5rem;
   }
-  
+
   .label {
     font-weight: 700;
     color: #334155;
@@ -402,54 +404,54 @@ const ActionCard = styled.div`
 `;
 
 const QuantityControl = styled.div`
-  display: flex; 
-  align-items: center; 
-  background: #F8FAFC; 
-  border-radius: 50px; 
+  display: flex;
+  align-items: center;
+  background: #F8FAFC;
+  border-radius: 50px;
   padding: 0.35rem;
   border: 1px solid #E2E8F0;
-  
-  button { 
-    background: #ffffff; 
-    color: #334155; 
-    border: none; 
-    width: 34px; 
-    height: 34px; 
-    border-radius: 50%; 
-    cursor: pointer; 
-    font-weight: 800; 
+
+  button {
+    background: #ffffff;
+    color: #334155;
+    border: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-weight: 800;
     font-size: 1.1rem;
-    display: flex; 
-    align-items: center; 
-    justify-content: center; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.05); 
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     transition: all 0.2s ease;
-    
+
     &:hover:not(:disabled) { background: #0B8457; color: white; }
   }
-  
+
   span { min-width: 40px; text-align: center; font-size: 1.1rem; font-weight: 700; color: #0F172A; }
 `;
 
 const AddToCartButton = styled(motion.button)`
-  width: 100%; 
-  padding: 1rem; 
-  background: ${props => props.$outOfStock ? '#F1F5F9' : 'linear-gradient(135deg, #0B8457 0%, #075E3E 100%)'}; 
-  color: ${props => props.$outOfStock ? '#94A3B8' : '#ffffff'}; 
-  border: none; 
-  border-radius: 14px; 
-  font-weight: 700; 
-  font-size: 1.1rem; 
-  cursor: ${props => props.$outOfStock ? 'not-allowed' : 'pointer'}; 
-  display: flex; 
-  align-items: center; 
-  justify-content: center; 
-  gap: 0.8rem; 
+  width: 100%;
+  padding: 1rem;
+  background: ${props => props.$outOfStock ? '#F1F5F9' : 'linear-gradient(135deg, #0B8457 0%, #075E3E 100%)'};
+  color: ${props => props.$outOfStock ? '#94A3B8' : '#ffffff'};
+  border: none;
+  border-radius: 14px;
+  font-weight: 700;
+  font-size: 1.1rem;
+  cursor: ${props => props.$outOfStock ? 'not-allowed' : 'pointer'};
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
   position: relative;
   overflow: hidden;
   box-shadow: ${props => props.$outOfStock ? 'none' : '0 6px 20px rgba(11, 132, 87, 0.25)'};
   transition: all 0.3s ease;
-  
+
   &::after {
     content: '';
     position: absolute;
@@ -461,13 +463,13 @@ const AddToCartButton = styled(motion.button)`
     transform: skewX(-25deg);
     animation: ${props => props.$outOfStock ? 'none' : 'shimmer 4s infinite'};
   }
-  
+
   @keyframes shimmer {
     0% { left: -150%; }
     20% { left: 200%; }
     100% { left: 200%; }
   }
-  
+
   &:hover:not(:disabled) { box-shadow: 0 8px 25px rgba(11, 132, 87, 0.4); }
 `;
 
@@ -481,7 +483,7 @@ const DescriptionContainer = styled.div`
     align-items: center;
     gap: 1.5rem;
     margin-bottom: 2rem;
-    
+
     h2 {
       font-size: 1.6rem;
       font-weight: 800;
@@ -489,7 +491,7 @@ const DescriptionContainer = styled.div`
       margin: 0;
       white-space: nowrap;
     }
-    
+
     .line {
       height: 1px;
       flex-grow: 1;
@@ -514,13 +516,13 @@ const ReviewsSection = styled.div`
   max-width: 1200px;
   margin: 4rem auto 0 auto;
   padding: 0 1.5rem;
-  
+
   .header {
     display: flex;
     align-items: center;
     gap: 1.5rem;
     margin-bottom: 2rem;
-    
+
     h2 {
       font-size: 1.6rem;
       font-weight: 800;
@@ -528,7 +530,7 @@ const ReviewsSection = styled.div`
       margin: 0;
       white-space: nowrap;
     }
-    
+
     .line {
       height: 1px;
       flex-grow: 1;
@@ -545,7 +547,7 @@ const EmptyReviews = styled.div`
   border: 1px dashed #CBD5E1;
   max-width: 600px;
   margin: 0 auto;
-  
+
   .emoji { font-size: 2.5rem; display: block; margin-bottom: 1rem; }
   p { color: #64748B; font-size: 1.05rem; }
 `;
@@ -554,7 +556,7 @@ const ReviewGrid = styled.div`
   display: grid;
   grid-template-columns: 1fr;
   gap: 1.5rem;
-  
+
   @media (min-width: 768px) {
     grid-template-columns: 1fr 1fr;
   }
@@ -566,14 +568,14 @@ const ReviewCard = styled.div`
   padding: 1.5rem;
   border: 1px solid rgba(11, 132, 87, 0.08);
   box-shadow: 0 4px 20px rgba(0,0,0,0.02);
-  
+
   .reviewer {
     display: flex;
     align-items: center;
     gap: 1rem;
     margin-bottom: 1rem;
   }
-  
+
   .avatar {
     width: 45px;
     height: 45px;
@@ -586,13 +588,13 @@ const ReviewCard = styled.div`
     font-weight: 800;
     font-size: 1.2rem;
   }
-  
+
   .details strong {
     display: block;
     color: #0F172A;
     font-size: 1.05rem;
   }
-  
+
   .comment {
     color: #475569;
     font-style: italic;
@@ -612,18 +614,18 @@ const PaginationWrapper = styled.div`
 `;
 
 const PageButton = styled.button`
-  padding: 0.6rem 1.4rem; 
-  border-radius: 50px; 
-  border: none; 
-  font-weight: 700; 
-  background: ${props => props.disabled ? '#F1F5F9' : '#0B8457'}; 
-  color: ${props => props.disabled ? '#94A3B8' : 'white'}; 
-  cursor: ${props => props.disabled ? 'not-allowed' : 'pointer'}; 
-  transition: all 0.2s ease; 
-  
-  &:hover:not(:disabled) { 
-    background: #086341; 
-    transform: translateY(-1px); 
+  padding: 0.6rem 1.4rem;
+  border-radius: 50px;
+  border: none;
+  font-weight: 700;
+  background: ${props => props.disabled ? '#F1F5F9' : '#0B8457'};
+  color: ${props => props.disabled ? '#94A3B8' : 'white'};
+  cursor: ${props => props.disabled ? 'not-allowed' : 'pointer'};
+  transition: all 0.2s ease;
+
+  &:hover:not(:disabled) {
+    background: #086341;
+    transform: translateY(-1px);
   }
 `;
 

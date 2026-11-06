@@ -1,17 +1,58 @@
 // src/pages/OrderSuccess.jsx
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useContext, useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import styled from 'styled-components';
 import { FaCheckCircle, FaReceipt, FaTruck, FaMapMarkerAlt, FaPhoneAlt, FaArrowRight, FaStore } from 'react-icons/fa';
 import AppLayout from '../components/AppLayout';
-import {GlowingPageContainer } from '../styles/SharedPageStyles';
+import AuthContext from '../context/AuthContext';
+import { GlowingPageContainer } from '../styles/SharedPageStyles';
 
 const OrderSuccess = () => {
   const { orderId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  
-  const { order, payment, userAddress, userPhone } = location.state || {};
+  const auth = useContext(AuthContext);
+  const axiosInstance = auth?.axiosInstance;
+
+  const stateData = location.state || {};
+  const [order, setOrder] = useState(stateData.order || null);
+  const [payment, setPayment] = useState(stateData.payment || null);
+  const [userAddress, setUserAddress] = useState(stateData.userAddress || '');
+  const [userPhone, setUserPhone] = useState(stateData.userPhone || '');
+  const [loading, setLoading] = useState(!stateData.order);
+
+  useEffect(() => {
+    if (order && payment) return;
+    if (!axiosInstance || !orderId) {
+      setLoading(false);
+      return;
+    }
+
+    let isMounted = true;
+    const fetchOrderDetails = async () => {
+      try {
+        setLoading(true);
+        const res = await axiosInstance.get(`/api/orders/${orderId}/`);
+        if (!isMounted) return;
+        const data = res.data;
+        setOrder({ total_price: data.total_price });
+        setUserAddress(data.shipping_address || 'Confirmed Delivery Address');
+        setUserPhone(data.contact_phone || 'Verified Customer Phone');
+        setPayment(data.payment?.[0] || {
+          payment_method: 'online_gateway',
+          transaction_id: `ORD-${orderId}`,
+        });
+      } catch (err) {
+        // Fallback gracefully without breaking receipt layout
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    };
+
+    fetchOrderDetails();
+    return () => { isMounted = false; };
+  }, [orderId, axiosInstance, order, payment]);
 
   const containerVariants = {
     hidden: { opacity: 0 },
@@ -35,24 +76,30 @@ const OrderSuccess = () => {
     <AppLayout>
       <GlowingPageContainer $maxWidth="1100px">
         <SuccessContainer variants={containerVariants} initial="hidden" animate="visible">
-          
+
           <IconWrapper variants={checkVariants}>
             <div className="aura-ring" />
             <FaCheckCircle />
           </IconWrapper>
-          
+
           <motion.h1 variants={itemVariants}>Payment Successful!</motion.h1>
           <motion.p variants={itemVariants} className="subtitle">
             Thank you for choosing EazyShop. Your secure transaction has been processed and order <strong>#{orderId}</strong> is confirmed.
           </motion.p>
+
+          {loading && !order && (
+            <DetailCard variants={itemVariants} style={{ maxWidth: '600px', margin: '0 auto', textAlign: 'center' }}>
+              <p style={{ margin: 0, color: '#0B8457', fontWeight: 600 }}>Verifying confirmed transaction...</p>
+            </DetailCard>
+          )}
 
           {order && payment && (
             <GridContainer variants={itemVariants}>
               <DetailCard>
                 <h3><FaReceipt /> Transaction Details</h3>
                 <Divider />
-                <InfoRow><span>Payment Method:</span> <strong>{payment.payment_method.replace('_', ' ').toUpperCase()}</strong></InfoRow>
-                <InfoRow><span>Transaction ID:</span> <strong className="mono">{payment.transaction_id}</strong></InfoRow>
+                <InfoRow><span>Payment Method:</span> <strong>{(payment.payment_method || 'ONLINE').replace('_', ' ').toUpperCase()}</strong></InfoRow>
+                <InfoRow><span>Transaction ID:</span> <strong className="mono">{payment.transaction_id || `ORD-${orderId}`}</strong></InfoRow>
                 <InfoRow><span>Total Paid:</span> <strong className="highlight">₹{order.total_price}</strong></InfoRow>
               </DetailCard>
 
@@ -60,12 +107,12 @@ const OrderSuccess = () => {
                 <h3><FaTruck /> Fulfillment Dispatch</h3>
                 <Divider />
                 <InfoRow className="address-row">
-                  <FaMapMarkerAlt className="icon-sub" /> 
-                  <span>{userAddress}</span>
+                  <FaMapMarkerAlt className="icon-sub" />
+                  <span>{userAddress || 'Confirmed Delivery Address'}</span>
                 </InfoRow>
                 <InfoRow style={{ marginTop: '0.8rem' }}>
-                  <span className="label-flex"><FaPhoneAlt className="icon-sub" /> Contact Phone:</span> 
-                  <strong>{userPhone}</strong>
+                  <span className="label-flex"><FaPhoneAlt className="icon-sub" /> Contact Phone:</span>
+                  <strong>{userPhone || 'Verified Customer Phone'}</strong>
                 </InfoRow>
               </DetailCard>
             </GridContainer>
@@ -95,37 +142,37 @@ export default OrderSuccess;
 const SuccessContainer = styled(motion.div)`
   position: relative;
   z-index: 1;
-  
-  background: rgba(236, 253, 245, 0.85); 
+
+  background: rgba(236, 253, 245, 0.85);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   max-width: 950px; /* 🚀 Fix: Slightly widened container for better room */
   width: 100%;
   border-radius: 32px;
   padding: 4rem 3rem;
-  margin: 3rem auto; 
+  margin: 3rem auto;
   box-shadow: 0 30px 60px -15px rgba(11, 132, 87, 0.15);
   border: 1px solid rgba(16, 185, 129, 0.3);
   text-align: center;
-  box-sizing: border-box; 
-  
-  h1 { 
-    color: #0B8457; 
-    margin-bottom: 0.6rem; 
-    font-size: 2.8rem; 
+  box-sizing: border-box;
+
+  h1 {
+    color: #0B8457;
+    margin-bottom: 0.6rem;
+    font-size: 2.8rem;
     font-weight: 900;
     letter-spacing: -1px;
   }
-  
-  .subtitle { 
-    color: #475569; 
-    font-size: 1.15rem; 
-    margin-bottom: 3rem; 
+
+  .subtitle {
+    color: #475569;
+    font-size: 1.15rem;
+    margin-bottom: 3rem;
     line-height: 1.6;
     max-width: 600px;
     margin-inline: auto;
 
-    strong { color: #0F172A; } 
+    strong { color: #0F172A; }
   }
 
   @media(max-width: 768px) {
@@ -133,7 +180,7 @@ const SuccessContainer = styled(motion.div)`
     width: calc(100% - 1rem); /* 🚀 Fix: Maximizes mobile width safely */
     padding: 2.5rem 1rem;
     border-radius: 24px;
-    
+
     h1 { font-size: 2.2rem; }
   }
 `;
@@ -148,7 +195,7 @@ const IconWrapper = styled(motion.div)`
   justify-content: center;
   font-size: 5rem;
   color: #ffffff;
-  background: #10B981; 
+  background: #10B981;
   border-radius: 50%;
   border: 4px solid #ffffff;
   box-shadow: 0 10px 25px rgba(16, 185, 129, 0.3);
@@ -157,7 +204,7 @@ const IconWrapper = styled(motion.div)`
     position: absolute;
     inset: -12px;
     border-radius: 50%;
-    background: rgba(16, 185, 129, 0.15); 
+    background: rgba(16, 185, 129, 0.15);
     animation: pulseAura 2.5s infinite ease-in-out;
   }
 
@@ -172,7 +219,7 @@ const IconWrapper = styled(motion.div)`
     z-index: 2;
     color: #ffffff;
   }
-  
+
   @media(max-width: 768px) {
     width: 80px;
     height: 80px;
@@ -186,7 +233,7 @@ const GridContainer = styled(motion.div)`
   gap: 1.5rem;
   margin-bottom: 3rem;
   text-align: left;
-  
+
   @media (max-width: 750px) {
     grid-template-columns: 1fr;
   }
@@ -199,16 +246,16 @@ const DetailCard = styled.div`
   padding: 1.8rem;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.04);
   box-sizing: border-box; /* 🚀 Fix: Internalize sizing */
-  
-  h3 { 
-    display: flex; 
-    align-items: center; 
-    gap: 0.6rem; 
-    color: #0F172A; 
-    font-size: 1.15rem; 
+
+  h3 {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    color: #0F172A;
+    font-size: 1.15rem;
     font-weight: 800;
-    margin: 0; 
-    
+    margin: 0;
+
     svg { color: #0B8457; }
   }
 
@@ -227,38 +274,38 @@ const InfoRow = styled.div`
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 1rem; 
+  gap: 1rem;
   margin-bottom: 0.8rem;
   font-size: 0.98rem;
   color: #334155;
-  
+
   span { color: #64748B; font-weight: 500; flex-shrink: 0; }
   strong { color: #0F172A; font-weight: 700; text-align: right; }
-  
-  .mono { 
-    font-family: monospace; 
-    font-size: 0.85rem; 
-    background: #F8FAFC; 
-    padding: 0.15rem 0.5rem; 
-    border-radius: 4px; 
-    border: 1px solid #E2E8F0; 
-    word-break: break-all; 
+
+  .mono {
+    font-family: monospace;
+    font-size: 0.85rem;
+    background: #F8FAFC;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #E2E8F0;
+    word-break: break-all;
     max-width: 220px;
     text-align: right;
   }
-  
+
   .highlight { color: #0B8457; font-size: 1.25rem; font-weight: 900; }
-  
+
   .icon-sub { color: #0B8457; margin-right: 0.6rem; flex-shrink: 0; }
-  
+
   &.address-row {
     align-items: flex-start;
     text-align: left;
-    
+
     /* 🚀 CRITICAL FIX: Forces long address strings to wrap and stay inside the card boundaries */
-    span { 
-      color: #334155; 
-      line-height: 1.5; 
+    span {
+      color: #334155;
+      line-height: 1.5;
       flex: 1;
       min-width: 0;
       word-break: break-word;
@@ -282,7 +329,7 @@ const ActionButtons = styled(motion.div)`
   display: flex;
   justify-content: center;
   gap: 1.2rem;
-  
+
   @media (max-width: 500px) {
     flex-direction: column;
   }

@@ -35,6 +35,8 @@ export const AuthProvider = ({ children }) => {
     const instance = axios.create({
       baseURL: API_URL,
       withCredentials: true, // 🚀 Automatically attaches HTTP-Only cookies
+      xsrfCookieName: 'csrftoken',
+      xsrfHeaderName: 'X-CSRFToken',
     });
 
     // Request Interceptor: Attach Bearer token as fallback for environments blocking cross-site cookies
@@ -76,7 +78,10 @@ export const AuthProvider = ({ children }) => {
           try {
             const storedRefresh = localStorage.getItem('refresh_token');
             const payload = storedRefresh ? { refresh: storedRefresh } : {};
-            const refreshRes = await instance.post('/api/token/refresh/', payload);
+            // FE-P0-02: Use raw unintercepted axios call to avoid self-referential interceptor deadlock
+            const refreshRes = await axios.post(`${API_URL}/api/token/refresh/`, payload, {
+              withCredentials: true,
+            });
 
             if (refreshRes.data?.access) {
               localStorage.setItem('access_token', refreshRes.data.access);
@@ -210,6 +215,7 @@ export const AuthProvider = ({ children }) => {
 
   // 4. CROSS-TAB WALLET SYNC (BroadcastChannel)
   useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
     const channel = new BroadcastChannel('eazyshop_wallet_sync');
     channel.onmessage = (event) => {
       if (event.data?.type === 'SYNC_WALLET') {
@@ -232,9 +238,15 @@ export const AuthProvider = ({ children }) => {
       if (updatedUser) localStorage.setItem('user', JSON.stringify(updatedUser));
       return updatedUser;
     });
-    const channel = new BroadcastChannel('eazyshop_wallet_sync');
-    channel.postMessage({ type: 'SYNC_WALLET', userId, newBalance });
-    channel.close();
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        const channel = new BroadcastChannel('eazyshop_wallet_sync');
+        channel.postMessage({ type: 'SYNC_WALLET', userId, newBalance });
+        channel.close();
+      } catch (e) {
+        console.warn('BroadcastChannel sync failed:', e);
+      }
+    }
   };
 
   // 5. LOGOUT USER METHOD
@@ -253,8 +265,8 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, setUser, loginUser, logoutUser, axiosInstance, syncWalletBalance, refreshUser }}>
-      {!loading && children}
+    <AuthContext.Provider value={{ user, setUser, loginUser, logoutUser, axiosInstance, syncWalletBalance, refreshUser, loading }}>
+      {children}
     </AuthContext.Provider>
   );
 };

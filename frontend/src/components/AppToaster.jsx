@@ -7,19 +7,13 @@ const AppToaster = () => {
   const TOAST_LIMIT = 1;
 
   useEffect(() => {
-    toasts.forEach((t, index) => {
-      // 1. The Limit: Instantly dismiss older toasts if a new one arrives
-      if (t.visible && index >= TOAST_LIMIT) {
+    // Cleanly dismiss older toasts exceeding the active TOAST_LIMIT without scheduling runaway timeouts
+    toasts
+      .filter((t) => t.visible)
+      .filter((_, index) => index >= TOAST_LIMIT)
+      .forEach((t) => {
         toast.dismiss(t.id);
-      }
-
-      // 2. The Nuclear Option: Force kill ANY visible toast after 3 seconds
-      if (t.visible) {
-        setTimeout(() => {
-          toast.dismiss(t.id);
-        }, 2000); 
-      }
-    });
+      });
   }, [toasts]);
 
   return (
@@ -29,7 +23,7 @@ const AppToaster = () => {
       reverseOrder={false}
       toastOptions={{
         // We still keep this here for desktop users
-        duration: 3000, 
+        duration: 3000,
         style: {
           background: "#ffffff",
           color: "#1f2937",

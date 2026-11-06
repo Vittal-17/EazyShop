@@ -1,4 +1,5 @@
-import threading
+from decimal import Decimal
+from api.utils.async_tasks import run_async
 
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
@@ -21,6 +22,7 @@ from .models import (
     Review,
     User,
     Wishlist,
+    WalletTransaction,
 )
 
 
@@ -49,10 +51,10 @@ class RegisterSerializer(serializers.ModelSerializer):
         user = User.objects.create(username=validated_data['username'], email=validated_data['email'])
         user.set_password(validated_data['password'])
         user.save()
-    
-        # 🚀 The New Welcome Email Trigger
-        threading.Thread(target=send_welcome_email, args=(user.email, user.username)).start()
-    
+
+        # 🚀 The New Welcome Email Trigger isolated via on_commit hook
+        transaction.on_commit(lambda: run_async(send_welcome_email, user.email, user.username))
+
         return user
 
 class UserProfileUpdateSerializer(serializers.ModelSerializer):
@@ -97,7 +99,7 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class ProductSerializer(serializers.ModelSerializer):
     vendor_name = serializers.CharField(source='vendor.username', read_only=True)
-    
+
     class Meta:
         model = Product
         fields = '__all__'
@@ -150,7 +152,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='product.name', read_only=True)
     description = serializers.CharField(source='product.description', read_only=True)
     image_url = serializers.CharField(source='product.image_url', read_only=True)
-    
+
     # 🚀 Add these fields to expose customer info and address directly to the vendor sale item
     username = serializers.CharField(source='order.user.username', read_only=True)
     shipping_address = serializers.CharField(source='order.shipping_address', read_only=True)
@@ -158,20 +160,20 @@ class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItem
         fields = [
-            'id', 'order', 'product', 'quantity', 'price', 
+            'id', 'order', 'product', 'quantity', 'price',
             'name', 'description', 'image_url', 'status', 'seller_earnings',
             'username', 'shipping_address'  # 🚀 Included here
         ]
         read_only_fields = ['id', 'price', 'seller_earnings', 'order', 'username', 'shipping_address']
 
-        
+
 class OrderSerializer(serializers.ModelSerializer):
     order_items = OrderItemSerializer(many=True)
 
     class Meta:
         model = Order
         fields = [
-            'id', 'user', 'status', 'created_at', 'order_items', 
+            'id', 'user', 'status', 'created_at', 'order_items',
             'total_price', 'shipping_address', 'contact_phone'
         ]
         read_only_fields = ['id', 'user', 'created_at', 'total_price']
@@ -204,35 +206,43 @@ class OrderSerializer(serializers.ModelSerializer):
         user = validated_data.pop('user', self.context['request'].user)
 
         with transaction.atomic():
-            total_price = 0
-                
+            # Deterministic lock ordering: sort product IDs to guarantee deadlock freedom
+            product_ids = sorted({item_data['product'].id for item_data in order_items_data})
+            products_qs = Product.objects.select_for_update().filter(id__in=product_ids).order_by('id')
+            products_map = {p.id: p for p in products_qs}
+
+            total_price = Decimal('0.00')
+
             for item_data in order_items_data:
-                product = Product.objects.select_for_update().get(id=item_data['product'].id)
-                    
+                product_id = item_data['product'].id
+                product = products_map.get(product_id)
+
                 # 🚨 SECURITY CHECK: Ensure product hasn't been soft-deleted or rejected
-                if not getattr(product, 'is_active', True) or getattr(product, 'approval_status', 'approved') != 'approved':
-                    raise serializers.ValidationError(f"Checkout failed: '{product.name}' is no longer available.")
+                if not product or not getattr(product, 'is_active', True) or getattr(product, 'approval_status', 'approved') != 'approved':
+                    product_name = product.name if product else f"ID {product_id}"
+                    raise serializers.ValidationError(f"Checkout failed: '{product_name}' is no longer available.")
 
                 if item_data['quantity'] > product.stock:
                     raise serializers.ValidationError(f"Checkout failed: '{product.name}' only has {product.stock} units left.")
-                    
-                actual_price = product.price 
+
+                actual_price = product.price
                 total_price += item_data['quantity'] * actual_price
-                    
+
                 # Inject server-verified data into the dictionary
                 item_data['price'] = actual_price
-                item_data['vendor'] = product.vendor # 🚀 THIS ROUTES THE FUNDS!
-                    
+                item_data['vendor'] = product.vendor  # 🚀 THIS ROUTES THE FUNDS!
+
                 product.stock -= item_data['quantity']
-                product.save()
+                product.save(update_fields=['stock'])
 
             order = Order.objects.create(user=user, total_price=total_price, **validated_data)
 
             for item_data in order_items_data:
                 OrderItem.objects.create(order=order, **item_data)
 
-            CartItem.objects.filter(cart__user=self.context['request'].user).delete()
-                
+            if 'request' in self.context:
+                CartItem.objects.filter(cart__user=self.context['request'].user).delete()
+
         return order
 
 
@@ -307,8 +317,8 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             "username": self.user.username,
             "email": self.user.email,
         }
-        
-        # 🚀 Temporarily expose tokens here so CookieTokenObtainPairView can read them 
+
+        # 🚀 Temporarily expose tokens here so CookieTokenObtainPairView can read them
         # before stripping them out of the final JSON body.
         data["access"] = str(access)
         data["refresh"] = str(refresh)
@@ -318,3 +328,10 @@ class GiftCardSerializer(serializers.ModelSerializer):
     class Meta:
         model = GiftCard
         fields = '__all__'
+
+
+class WalletTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WalletTransaction
+        fields = ['id', 'amount', 'balance_after', 'transaction_type', 'reference_id', 'description', 'created_at']
+        read_only_fields = fields

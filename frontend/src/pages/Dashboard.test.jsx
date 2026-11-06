@@ -9,6 +9,7 @@ jest.mock('react-hot-toast', () => {
   const t = jest.fn();
   t.success = jest.fn();
   t.error = jest.fn();
+  t.loading = jest.fn();
   return { toast: t };
 });
 
@@ -25,19 +26,26 @@ describe('Dashboard Component', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAxiosInstance.get.mockImplementation((url) => {
-      if (url === '/api/orders/') return Promise.resolve({ data: [{ id: 501, status: 'pending', total_price: '120.00', user: 1 }] });
+      if (url.startsWith('/api/orders/')) {
+        return Promise.resolve({ data: [{ id: 501, status: 'pending', total_price: '120.00', user: 1 }] });
+      }
+      if (url.startsWith('/api/order-items/')) {
+        return Promise.resolve({
+          data: [{ id: 1, product_name: 'Widget', quantity: 1, price: '120.00', image_url: '/media/widget.png' }]
+        });
+      }
       if (url === '/api/reviews/') return Promise.resolve({ data: [] });
       if (url === `/api/users/1/`) return Promise.resolve({ data: { phone: '5551234567' } });
       if (url === '/api/addresses/') return Promise.resolve({ data: [{ id: 1, label: 'Home', full_address: '123 Main St', is_default: true }] });
-      return Promise.resolve({ data: [] }); 
+      return Promise.resolve({ data: [] });
     });
   });
 
-  it('renders all concurrent data across tabs', async () => {
+  it('renders all concurrent data across tabs and formats environment asset URLs', async () => {
     renderDashboard();
     await waitFor(() => expect(screen.queryByText('Loading...')).not.toBeInTheDocument());
-    expect(screen.getByText('Order #501')).toBeInTheDocument();
-    
+    expect(await screen.findByText('Order #501')).toBeInTheDocument();
+
     fireEvent.click(screen.getByText(/Profile Settings/i));
     expect(await screen.findByText('123 Main St')).toBeInTheDocument();
   });
@@ -45,13 +53,13 @@ describe('Dashboard Component', () => {
   it('handles the order cancellation flow', async () => {
     mockAxiosInstance.post.mockResolvedValueOnce({});
     renderDashboard();
-    
+
     await screen.findByText('Order #501');
     fireEvent.click(screen.getByText('Cancel Order'));
-    
+
     expect(await screen.findByText(/Are you sure you want to cancel this order/i)).toBeInTheDocument();
     fireEvent.click(screen.getByText('Yes, Cancel'));
-    
+
     await waitFor(() => {
       expect(mockAxiosInstance.post).toHaveBeenCalledWith('/api/orders/501/cancel/');
       expect(toast.success).toHaveBeenCalledWith(expect.stringContaining('cancelled successfully'));

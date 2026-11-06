@@ -9,11 +9,11 @@
       transform: translateY(0);
     }
   }
-  
+
   .home-container {
     height: 100vh;
     width: 100%;
-    background-image: linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.2)), url(../../assets/home.jpg);
+    background-image: linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.2)), url(../../assets/home.webp);
     background-size: cover;
     background-repeat: no-repeat;
     background-position: center center;
@@ -21,7 +21,7 @@
     display: flex;
     flex-direction: column;
   }
-  
+
   .content-wrapper {
     flex: 1;
     backdrop-filter: blur(4px);
@@ -32,7 +32,7 @@
     text-align: center;
     padding: 2rem;
   }
-  
+
   .hero-heading {
     font-size: 3rem;
     font-weight: 700;
@@ -41,13 +41,13 @@
     text-shadow: 2px 2px 4px rgba(255, 255, 255, 0.3);
     animation: fadeInUp 0.8s ease-out;
   }
-  
+
   @media (min-width: 768px) {
     .hero-heading {
       font-size: 4rem;
     }
   }
-  
+
   .subtitle {
     font-size: 1.25rem;
     font-weight: 300;
@@ -59,7 +59,7 @@
     animation: fadeInUp 0.8s ease-out 0.2s;
     animation-fill-mode: backwards;
   }
-  
+
   @media (min-width: 768px) {
     .subtitle {
       font-size: 1.5rem;

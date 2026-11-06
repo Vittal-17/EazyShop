@@ -47,6 +47,8 @@ yarn-error.log*
 
 .vscode/
 .idea/
+.agents/
+.opencode/
 
 # ==========================
 # OS Files

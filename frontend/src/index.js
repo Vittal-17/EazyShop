@@ -4,11 +4,9 @@ import './index.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
 
-// Strip console logs and errors in production
+// Strip verbose debug logs in production while preserving error and warning telemetry
 if (process.env.NODE_ENV === 'production') {
   console.log = () => {};
-  console.error = () => {};
-  console.warn = () => {};
   console.debug = () => {};
 }
 

@@ -13,7 +13,7 @@ class IsAdminOrOwner(permissions.BasePermission):
         if request.user.is_staff:
             return True
         return obj.user == request.user
-    
+
 class IsOwnerOrAdmin(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.user.is_staff or getattr(request.user, 'role', '') == 'admin':
@@ -59,3 +59,14 @@ class IsProductOwnerOrAdmin(BasePermission):
             return True
         # Sellers may only modify their own products
         return getattr(request.user, 'role', '') == 'seller' and obj.vendor == request.user
+
+
+class IsAdminUserOrReadOnly(BasePermission):
+    """Allows safe methods (GET, HEAD, OPTIONS) for any user, but restricts write operations to admins."""
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return bool(
+            request.user and request.user.is_authenticated and
+            (getattr(request.user, 'role', '') == 'admin' or request.user.is_staff or request.user.is_superuser)
+        )

@@ -73,7 +73,7 @@ const Cart = () => {
   const [cartItems, setCartItems] = useState([]);
   const [wishlistIds, setWishlistIds] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  
+
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [itemToRemove, setItemToRemove] = useState(null);
 
@@ -88,7 +88,7 @@ const Cart = () => {
       const tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
       setCartItems(tempCart);
     }
-    setIsLoading(false); 
+    setIsLoading(false);
   };
 
   const fetchWishlist = async () => {
@@ -103,7 +103,7 @@ const Cart = () => {
     if (!user) {
       toast.error('Please log in to use your wishlist!');
       navigate('/login');
-      return; 
+      return;
     }
     if (wishlistIds.includes(productId)) return;
     try {
@@ -118,12 +118,14 @@ const Cart = () => {
       try {
         setCartItems(prevItems => prevItems.map(item => item.id === id ? { ...item, quantity } : item));
         await axiosInstance.patch(`/api/cart-items/${id}/`, { quantity });
+        window.dispatchEvent(new Event('cart-updated'));
       } catch (err) { fetchCartItems(); }
     } else {
       let tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
       tempCart = tempCart.map(item => item.id === id ? { ...item, quantity } : item);
       localStorage.setItem('tempCart', JSON.stringify(tempCart));
       setCartItems(tempCart);
+      window.dispatchEvent(new Event('cart-updated'));
     }
   };
 
@@ -137,13 +139,15 @@ const Cart = () => {
       try {
         await axiosInstance.delete(`/api/cart-items/${itemToRemove}/`);
         setCartItems(prev => prev.filter(item => item.id !== itemToRemove));
-      } catch (err) { console.error(err); } 
+        window.dispatchEvent(new Event('cart-updated'));
+      } catch (err) { console.error(err); }
       finally { setIsModalOpen(false); setItemToRemove(null); }
     } else {
       let tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
       tempCart = tempCart.filter(item => item.id !== itemToRemove);
       localStorage.setItem('tempCart', JSON.stringify(tempCart));
       setCartItems(tempCart);
+      window.dispatchEvent(new Event('cart-updated'));
       setIsModalOpen(false);
       setItemToRemove(null);
     }
@@ -209,20 +213,20 @@ const Cart = () => {
                       <ImageWrapper>
                         <img src={item.product_image} alt={item.product_name} />
                       </ImageWrapper>
-                      
+
                       <ProductDetails>
                         <div className="title-row">
                           <Link to={`/products/${item.product}`} className="title">{item.product_name}</Link>
                           <TotalPrice>{formatINR((item.quantity * Number(item.price)))}</TotalPrice>
                         </div>
-                        
+
                         <div className="price-row">
                           <UnitPrice>{formatINR(item.price)} each</UnitPrice>
                         </div>
 
                         <ControlsRow>
                           <CartQuantityController itemId={item.id} initialQuantity={item.quantity} stockLimit={item.product_stock || 99} onQuantityUpdate={handleQuantityChange} />
-                          
+
                           <ActionsGroup>
                             <WishlistButton onClick={() => handleAddToWishlist(item.product)} disabled={wishlistIds.includes(item.product)} title="Add to Wishlist">
                               {wishlistIds.includes(item.product) ? <FaHeart color="#DC2626" /> : <FaRegHeart />}
@@ -259,7 +263,7 @@ const Cart = () => {
                   <CheckoutButton onClick={handleProceedToCheckout} whileTap={{ scale: 0.98 }}>
                     Proceed to Checkout <FaArrowRight />
                   </CheckoutButton>
-                  
+
                   <SecureBadge>
                     <FaShieldAlt /> SSL Secure Encrypted Checkout
                   </SecureBadge>

@@ -15,7 +15,7 @@ jest.mock('axios', () => {
       response: { use: jest.fn(), eject: jest.fn() }
     }
   };
-  
+
   return {
     __esModule: true,
     default: {
@@ -37,9 +37,9 @@ jest.mock('react-hot-toast', () => ({
 describe('Main App Component', () => {
   it('renders the application without crashing', async () => {
     render(<App />);
-    
-    // Look for the brand name to ensure the home page loaded
-    const brandElement = await screen.findByText(/EazyShop/i);
-    expect(brandElement).toBeInTheDocument();
+
+    // Look for the brand heading to ensure the home page loaded
+    const brandHeading = await screen.findByRole('heading', { name: /Welcome to EazyShop/i });
+    expect(brandHeading).toBeInTheDocument();
   });
 });

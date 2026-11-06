@@ -20,20 +20,21 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
     try {
       const res = await axiosInstance.get(`/api/order-items/?order=${orderId}`);
       const items = res.data.results || res.data;
-      
+
       const formattedItems = items.map(item => {
         let rawImg = item.image_url || '';
         if (rawImg && rawImg.startsWith('/')) {
-          rawImg = `http://127.0.0.1:8000${rawImg}`;
+          const apiBase = process.env.REACT_APP_API_URL || '';
+          rawImg = `${apiBase}${rawImg}`;
         }
         return { ...item, image_url: rawImg };
       });
 
       setOrderItems(prev => ({ ...prev, [orderId]: formattedItems }));
-    } catch (error) { 
-      toast.error('❌ Failed to load order items'); 
-    } finally { 
-      setLoadingItems(false); 
+    } catch (error) {
+      toast.error('❌ Failed to load order items');
+    } finally {
+      setLoadingItems(false);
     }
   };
 
@@ -45,7 +46,7 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
       const response = await axiosInstance.get(`/api/orders/${orderId}/invoice/`, {
         responseType: 'blob', // Crucial for handling binary PDF stream
       });
-      
+
       const blob = new Blob([response.data], { type: 'application/pdf' });
       const link = document.createElement('a');
       link.href = window.URL.createObjectURL(blob);
@@ -53,7 +54,7 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      
+
       toast.success('📄 Invoice downloaded successfully!', { id: toastId });
     } catch (err) {
       toast.error('❌ Failed to download invoice PDF.', { id: toastId });
@@ -98,20 +99,20 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
               </div>
               {getStatusBadge(order.status)}
             </OrderHeader>
-            
+
             {order.shipping_address && (
               <AddressRow>
-                <FaMapMarkerAlt className="icon" /> 
+                <FaMapMarkerAlt className="icon" />
                 <span><strong>Shipped To:</strong> {order.shipping_address}</span>
               </AddressRow>
             )}
-            
+
             <OrderFooterRow>
               <OrderTotal>Total: <span>{formatINR(order.total_price)}</span></OrderTotal>
-              
+
               <ActionGroup>
                 {/* 📄 Invoice Download Button */}
-                <InvoiceButton 
+                <InvoiceButton
                   onClick={() => handleDownloadInvoice(order.id)}
                   disabled={downloadingOrderId === order.id}
                   whileTap={{ scale: 0.97 }}
@@ -119,14 +120,14 @@ const OrdersSection = ({ orders, isLoadingOrders, orderPage, totalOrderPages, se
                   <FaFileDownload /> {downloadingOrderId === order.id ? 'Generating...' : 'Invoice PDF'}
                 </InvoiceButton>
 
-                <ViewItemsButton 
+                <ViewItemsButton
                   onClick={() => { if(expandedOrderId === order.id) setExpandedOrderId(null); else { setExpandedOrderId(order.id); fetchOrderItems(order.id); } }}
                   whileTap={{ scale: 0.97 }}
                 >
                   {expandedOrderId === order.id ? 'Hide Items' : 'View Items'}
                 </ViewItemsButton>
 
-                {order.status === 'pending' && ( 
+                {order.status === 'pending' && (
                   <DashboardCancelButton onClick={() => onCancelOrderClick(order.id)} whileTap={{ scale: 0.97 }}>
                     <FaBan /> Cancel Order
                   </DashboardCancelButton>
@@ -231,8 +232,8 @@ const ActionGroup = styled.div` display: flex; gap: 0.8rem; flex-wrap: wrap; ali
 
 const InvoiceButton = styled(motion.button)`
   display: flex; align-items: center; gap: 0.5rem;
-  background: #ECFDF5; color: #0B8457; border: 1px solid rgba(11, 132, 87, 0.2); 
-  padding: 0.6rem 1.2rem; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.9rem; 
+  background: #ECFDF5; color: #0B8457; border: 1px solid rgba(11, 132, 87, 0.2);
+  padding: 0.6rem 1.2rem; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.9rem;
   transition: all 0.2s;
   &:hover:not(:disabled) { background: #D1FAE5; }
   &:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -263,17 +264,17 @@ const ItemImage = styled.div`
 
 const ItemDetails = styled.div`
   flex: 1; min-width: 200px;
-  h4 { margin: 0 0 0.3rem 0; color: #0F172A; font-weight: 700; font-size: 1.05rem; } 
-  .meta { display: flex; gap: 1rem; font-size: 0.9rem; color: #64748B; font-weight: 500; } 
+  h4 { margin: 0 0 0.3rem 0; color: #0F172A; font-weight: 700; font-size: 1.05rem; }
+  .meta { display: flex; gap: 1rem; font-size: 0.9rem; color: #64748B; font-weight: 500; }
 `;
 
 const ReviewTriggerButton = styled(motion.button)`
-  display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.2rem; 
-  background-color: ${props => props.$isEdit ? '#FEF3C7' : '#ECFDF5'}; 
-  color: ${props => props.$isEdit ? '#B45309' : '#047857'}; 
-  border: 1px solid ${props => props.$isEdit ? 'rgba(245, 158, 11, 0.3)' : 'rgba(16, 185, 129, 0.3)'}; 
-  border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.9rem; transition: all 0.2s ease; 
-  &:hover { filter: brightness(0.95); } 
+  display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1.2rem;
+  background-color: ${props => props.$isEdit ? '#FEF3C7' : '#ECFDF5'};
+  color: ${props => props.$isEdit ? '#B45309' : '#047857'};
+  border: 1px solid ${props => props.$isEdit ? 'rgba(245, 158, 11, 0.3)' : 'rgba(16, 185, 129, 0.3)'};
+  border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 0.9rem; transition: all 0.2s ease;
+  &:hover { filter: brightness(0.95); }
   @media (max-width: 600px) { width: 100%; justify-content: center; margin-top: 10px; }
 `;
 

@@ -24,7 +24,7 @@ const renderCart = () => render(
 describe('Cart Component', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    jest.useFakeTimers(); 
+    jest.useFakeTimers();
     mockAxiosInstance.get.mockImplementation((url) => {
       if (url === '/api/cart-items/') return Promise.resolve({ data: [{ id: 10, product: 1, product_name: 'Gaming Mouse', quantity: 1, price: '50.00', product_stock: 5 }] });
       if (url === '/api/wishlist/') return Promise.resolve({ data: [] });
@@ -34,15 +34,15 @@ describe('Cart Component', () => {
 
   afterEach(() => {
     act(() => { jest.runOnlyPendingTimers(); });
-    jest.useRealTimers(); 
+    jest.useRealTimers();
   });
 
   it('debounces the quantity update API call', async () => {
     mockAxiosInstance.patch.mockResolvedValueOnce({});
     renderCart();
-    
+
     await screen.findByText('Gaming Mouse');
-    const incrementBtn = screen.getByText('➕');
+    const incrementBtn = screen.getByRole('button', { name: '+' });
     fireEvent.click(incrementBtn);
     fireEvent.click(incrementBtn);
 

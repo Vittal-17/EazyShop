@@ -27,14 +27,16 @@ const renderWithAuth = (ui, user = null) => {
 describe('Products Component', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    
-    // 3. The Smart Interceptor
+
+    // 3. The Smart Interceptor supporting pagination query parameters
     mockAxiosInstance.get.mockImplementation((url) => {
-      if (url === '/api/products/') {
-        return Promise.resolve({ data: [{ id: 1, name: 'Test Laptop', price: '1000.00' }] });
-      }
-      if (url === '/api/products/1/') {
-        return Promise.resolve({ data: { id: 1, image_url: 'fake.jpg', stock: 5 } });
+      if (url.startsWith('/api/products/?') || url === '/api/products/') {
+        return Promise.resolve({
+          data: {
+            count: 1,
+            results: [{ id: 1, name: 'Test Laptop', price: '1000.00', stock: 5, image_url: 'fake.jpg' }]
+          }
+        });
       }
       if (url === '/api/categories/') {
         return Promise.resolve({ data: [{ id: 1, name: 'Electronics' }] });
@@ -43,20 +45,35 @@ describe('Products Component', () => {
     });
   });
 
-  it('renders products and categories successfully', async () => {
+  it('renders products directly without secondary N+1 detail queries', async () => {
     renderWithAuth(<Products />);
-    
-    // Use findByText to wait for the Promise.all to resolve
+
+    // Check product name and formatted price
     expect(await screen.findByText('Test Laptop')).toBeInTheDocument();
-    expect(await screen.findByText('₹1000.00')).toBeInTheDocument();
+    expect(await screen.findByText('₹1,000.00')).toBeInTheDocument();
+
+    // Verify ZERO N+1 secondary requests were made
+    const calls = mockAxiosInstance.get.mock.calls.map(c => c[0]);
+    expect(calls.some(url => url === '/api/products/1/')).toBe(false);
   });
 
   it('filters out products when out of stock toggle is clicked', async () => {
-    // Override the mock to return an out-of-stock item for this specific test
+    // Return an out-of-stock item directly in the catalog payload
     mockAxiosInstance.get.mockImplementation((url) => {
-      if (url === '/api/products/') return Promise.resolve({ data: [{ id: 2, name: 'Dead Item', price: '10' }] });
-      if (url === '/api/products/2/') return Promise.resolve({ data: { id: 2, stock: 0 } });
-      if (url === '/api/categories/') return Promise.resolve({ data: [] });
+      if (url.includes('in_stock=true')) {
+        return Promise.resolve({ data: { count: 0, results: [] } });
+      }
+      if (url.startsWith('/api/products/?') || url === '/api/products/') {
+        return Promise.resolve({
+          data: {
+            count: 1,
+            results: [{ id: 2, name: 'Dead Item', price: '10.00', stock: 0 }]
+          }
+        });
+      }
+      if (url === '/api/categories/') {
+        return Promise.resolve({ data: [] });
+      }
       return Promise.resolve({ data: [] });
     });
 
