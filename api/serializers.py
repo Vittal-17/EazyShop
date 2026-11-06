@@ -33,6 +33,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'username', 'email', 'role', 'phone', 'profile_picture', 'wallet_balance']
+        read_only_fields = fields
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
@@ -48,7 +49,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        user = User.objects.create(username=validated_data['username'], email=validated_data['email'])
+        user = User(username=validated_data['username'], email=validated_data['email'])
         user.set_password(validated_data['password'])
         user.save()
 
@@ -59,18 +60,25 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class UserProfileUpdateSerializer(serializers.ModelSerializer):
     profile_picture = serializers.ImageField(required=False)
+
     class Meta:
         model = User
-        fields = ['id','username', 'email', 'phone', 'role', 'profile_picture']
-        read_only_fields = ['id']
+        fields = ['id', 'username', 'email', 'phone', 'role', 'profile_picture']
+        read_only_fields = ['id', 'role']
         extra_kwargs = {'email': {'required': False}, 'username': {'required': False}}
 
-    def validate(self, data):
-        if 'role' in data:
-            request_user = self.context['request'].user
-            if getattr(request_user, 'role', None) != 'admin':
-                raise serializers.ValidationError({"role": "You do not have permission to modify user roles."})
-        return data
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        # A full-row save could overwrite a concurrent wallet or role change.
+        if validated_data:
+            instance.save(update_fields=validated_data.keys())
+        return instance
+
+
+class AdminUserProfileUpdateSerializer(UserProfileUpdateSerializer):
+    class Meta(UserProfileUpdateSerializer.Meta):
+        read_only_fields = ['id']
 
 class ChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(required=True, write_only=True)

@@ -39,7 +39,7 @@ from rest_framework import serializers
 import sys
 
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import generics, status, viewsets
+from rest_framework import generics, mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import OrderingFilter, SearchFilter
@@ -91,6 +91,7 @@ from .permissions import (
 from .serializers import (
     AddressSerializer,
     AdminLogSerializer,
+    AdminUserProfileUpdateSerializer,
     CartItemSerializer,
     CartSerializer,
     CategorySerializer,
@@ -129,7 +130,13 @@ def log_admin_action(user, message):
 # ==========================================
 # 1. USERS & AUTHENTICATION
 # ==========================================
-class UserViewSet(viewsets.ModelViewSet):
+class UserViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     queryset = User.objects.all()
     permission_classes = [IsAuthenticated]
     lookup_field = 'id'
@@ -173,6 +180,8 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def get_serializer_class(self):
         if self.action in ['update', 'partial_update']:
+            if IsAdminUser().has_permission(self.request, self):
+                return AdminUserProfileUpdateSerializer
             return UserProfileUpdateSerializer
         if self.action == 'change_password':
             return ChangePasswordSerializer
@@ -223,13 +232,25 @@ class UserViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
         is_owner = request.user.id == instance.id
-        is_admin = getattr(request.user, 'role', None) == 'admin'
+        is_admin = IsAdminUser().has_permission(request, self)
 
         if not is_owner and not is_admin:
             return Response({"error": "Unauthorized action."}, status=status.HTTP_403_FORBIDDEN)
 
         if 'role' in request.data and not is_admin:
             return Response({"error": "Only admins can modify user roles."}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = self.get_serializer(instance, data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        new_password = request.data.get('password')
+
+        # Application role management does not authorize changing another account's credentials.
+        changes_email = serializer.validated_data.get('email', instance.email) != instance.email
+        if not is_owner and not request.user.is_superuser and (new_password or changes_email):
+            return Response(
+                {"error": "Cannot change another user's password or recovery email."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if ('password' in request.data or 'phone' in request.data) and not is_admin:
             submitted_otp = request.data.get('otp')
@@ -260,9 +281,9 @@ class UserViewSet(viewsets.ModelViewSet):
             cache.delete(attempt_key)
             cache.delete(f"profile_otp_{request.user.id}")
 
-        new_password = request.data.get('password')
         current_password = request.data.get('current_password')
 
+        password_update = {}
         if new_password:
             if not current_password or not instance.check_password(current_password):
                 return Response({"error": "Current password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
@@ -273,12 +294,13 @@ class UserViewSet(viewsets.ModelViewSet):
             except DjangoValidationError as val_err:
                 return Response({"error": list(val_err.messages)}, status=status.HTTP_400_BAD_REQUEST)
             instance.set_password(new_password)
-            instance.save()
+            password_update['password'] = instance.password
 
         try:
-            return super().update(request, *args, **kwargs)
+            serializer.save(**password_update)
         except Exception:
             return Response({"error": "Profile update failed."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.data)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated], url_path='verify-password')
     def verify_password(self, request):

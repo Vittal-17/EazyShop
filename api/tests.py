@@ -5,6 +5,7 @@ from decimal import Decimal
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
+from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -28,7 +29,342 @@ from .models import (
     User,
     WalletTransaction,
 )
-from .serializers import OrderSerializer
+from .serializers import OrderSerializer, UserProfileUpdateSerializer, UserSerializer
+
+
+class UserPrivilegeRegressionTests(APITestCase):
+    user_urls = ('/api/users/', '/api/secure/api/users/')
+    password = 'Fixture-Account-Passphrase-37!'
+
+    @classmethod
+    def setUpTestData(cls):
+        for name, attributes in (
+            ('customer', {}),
+            ('seller', {'role': 'seller'}),
+            ('staff', {'is_staff': True}),
+            ('app_admin', {'role': 'admin'}),
+            ('django_admin', {'is_staff': True, 'is_superuser': True}),
+        ):
+            user = User.objects.create_user(
+                username=name, email=f'{name}@example.invalid', password=cls.password, **attributes
+            )
+            setattr(cls, name, user)
+        cls.group = Group.objects.create(name='Privileged fixture group')
+        cls.change_user = Permission.objects.get(content_type__app_label='api', codename='change_user')
+        cls.group.permissions.add(cls.change_user)
+
+    def privileged_fields(self):
+        return {
+            'role': 'admin',
+            'wallet_balance': '500.00',
+            'is_staff': True,
+            'is_superuser': True,
+            'groups': [self.group.pk],
+            'user_permissions': [self.change_user.pk],
+            'is_active': False,
+        }
+
+    def privilege_payloads(self):
+        fields = self.privileged_fields()
+        for name, value in fields.items():
+            yield name, {name: value}
+        yield 'combined', fields
+        yield 'nested', {'user': fields, 'profile': fields}
+
+    def privilege_state(self, user):
+        user.refresh_from_db()
+        return (
+            user.role, user.wallet_balance, user.is_staff, user.is_superuser, user.is_active,
+            list(user.groups.values_list('pk', flat=True)),
+            list(user.user_permissions.values_list('pk', flat=True)),
+        )
+
+    def test_generic_creation_is_unavailable_on_both_mounts(self):
+        original_count = User.objects.count()
+        for actor in (None, self.customer, self.seller, self.staff, self.app_admin, self.django_admin):
+            self.client.force_authenticate(user=actor)
+            expected = status.HTTP_401_UNAUTHORIZED if actor is None else status.HTTP_405_METHOD_NOT_ALLOWED
+            for url in self.user_urls:
+                for name, fields in self.privilege_payloads():
+                    with self.subTest(actor=actor, url=url, fields=name):
+                        response = self.client.post(url, {
+                            'username': 'injected-account', 'email': 'injected@example.invalid', **fields,
+                        }, format='json')
+                        self.assertEqual(response.status_code, expected)
+                        self.assertEqual(User.objects.count(), original_count)
+        self.assertFalse(WalletTransaction.objects.exists())
+
+    def test_put_and_patch_cannot_assign_unauthorized_fields(self):
+        for actor in (None, self.customer, self.seller, self.staff, self.app_admin, self.django_admin):
+            self.client.force_authenticate(user=actor)
+            target = self.customer if actor is None or actor == self.app_admin else actor
+            original = self.privilege_state(target)
+            for url in self.user_urls:
+                for method in (self.client.put, self.client.patch):
+                    for name, fields in self.privilege_payloads():
+                        if actor == self.app_admin:
+                            # Role changes by this actor have their own positive test.
+                            fields = {key: value for key, value in fields.items() if key != 'role'}
+                            if not fields:
+                                continue
+                        with self.subTest(actor=actor, url=url, method=method.__name__, fields=name):
+                            response = method(f'{url}{target.pk}/', fields, format='json')
+                            expected = status.HTTP_200_OK
+                            if actor is None:
+                                expected = status.HTTP_401_UNAUTHORIZED
+                            elif 'role' in fields:
+                                expected = status.HTTP_403_FORBIDDEN
+                            self.assertEqual(response.status_code, expected, response.data)
+                            self.assertEqual(self.privilege_state(target), original)
+            if actor in (self.customer, self.seller, self.staff):
+                self.assertEqual(self.client.get('/api/orders/admin-all/').status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(WalletTransaction.objects.exists())
+
+    def test_other_accounts_are_protected_on_both_mounts(self):
+        for actor, expected in (
+            (self.customer, status.HTTP_404_NOT_FOUND),
+            (self.seller, status.HTTP_404_NOT_FOUND),
+            (self.staff, status.HTTP_403_FORBIDDEN),
+        ):
+            self.client.force_authenticate(user=actor)
+            for url in self.user_urls:
+                response = self.client.patch(f'{url}{self.app_admin.pk}/', {
+                    'email': 'injected@example.invalid', 'role': 'user',
+                }, format='json')
+                self.assertEqual(response.status_code, expected)
+        self.app_admin.refresh_from_db()
+        self.assertEqual(self.app_admin.email, 'app_admin@example.invalid')
+        self.assertEqual(self.app_admin.role, 'admin')
+
+    def test_app_admin_can_manage_roles_but_cannot_assign_django_or_wallet_privileges(self):
+        self.client.force_authenticate(user=self.app_admin)
+        original = self.privilege_state(self.customer)
+        for url, method, role in (
+            (self.user_urls[0], self.client.patch, 'seller'),
+            (self.user_urls[1], self.client.put, 'admin'),
+        ):
+            response = method(f'{url}{self.customer.pk}/', {
+                **self.privileged_fields(), 'role': role,
+            }, format='json')
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+            self.assertEqual(response.data['role'], role)
+            self.assertEqual(self.privilege_state(self.customer), (role, *original[1:]))
+        self.assertFalse(WalletTransaction.objects.exists())
+
+    @patch('api.views.send_otp_email')
+    def test_app_admin_cannot_take_over_another_account_through_recovery(self, send_otp):
+        other_admin = User.objects.create_user(
+            username='other-admin', email='other-admin@example.invalid', password=self.password, role='admin'
+        )
+        injected_email = 'injected@example.invalid'
+        new_password = 'Replacement-Password-31!'
+        self.client.force_authenticate(user=self.app_admin)
+        for url in self.user_urls:
+            for target in (self.customer, other_admin, self.staff, self.django_admin):
+                original_email = target.email
+                for method in (self.client.patch, self.client.put):
+                    for payload in (
+                        {'email': injected_email},
+                        {'password': new_password, 'current_password': self.password},
+                        {'email': injected_email, 'password': new_password, 'current_password': self.password},
+                    ):
+                        with self.subTest(url=url, target=target, method=method.__name__, fields=tuple(payload)):
+                            response = method(f'{url}{target.pk}/', payload, format='json')
+                            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+                            target.refresh_from_db()
+                            self.assertEqual(target.email, original_email)
+                            self.assertTrue(target.check_password(self.password))
+
+        self.client.force_authenticate(user=None)
+        requested = self.client.post('/api/password-reset/request/', {'email': injected_email}, format='json')
+        self.assertEqual(requested.status_code, status.HTTP_400_BAD_REQUEST)
+        send_otp.assert_not_called()
+
+        for target in (self.customer, other_admin):
+            with self.subTest(target=target):
+                requested = self.client.post('/api/password-reset/request/', {'email': target.email}, format='json')
+                self.assertEqual(requested.status_code, status.HTTP_200_OK)
+                self.assertEqual(send_otp.call_args.kwargs['to_email'], target.email)
+                # Even a valid code for this account is unusable at the attempted replacement address.
+                rejected = self.client.post('/api/password-reset/confirm/', {
+                    'email': injected_email, 'otp': send_otp.call_args.kwargs['otp'],
+                    'new_password': new_password, 'user_id': target.pk,
+                }, format='json')
+                self.assertEqual(rejected.status_code, status.HTTP_400_BAD_REQUEST)
+                target.refresh_from_db()
+                self.assertTrue(target.check_password(self.password))
+
+    @patch('api.views.send_otp_email')
+    def test_registration_and_otp_recovery_cannot_escalate(self, send_otp):
+        credentials = {'username': 'new-buyer', 'email': 'new-buyer@example.invalid'}
+        fields = self.privileged_fields()
+        with self.captureOnCommitCallbacks(execute=False):
+            registration = self.client.post('/api/register/', {
+                **credentials, 'password': self.password, 'password2': self.password, **fields,
+            }, format='json')
+        self.assertEqual(registration.status_code, status.HTTP_201_CREATED, registration.data)
+        account = User.objects.get(email=credentials['email'])
+        original = ('user', Decimal('0.00'), False, False, True, [], [])
+        self.assertEqual(self.privilege_state(account), original)
+        self.assertTrue(account.check_password(self.password))
+        requested = self.client.post('/api/password-reset/request/', {
+            'email': account.email, **fields,
+        }, format='json')
+        self.assertEqual(requested.status_code, status.HTTP_200_OK)
+        self.assertEqual(send_otp.call_args.kwargs['to_email'], account.email)
+        otp = send_otp.call_args.kwargs['otp']
+        new_password = 'Recovery-Fixture-Passphrase-62!'
+        payload = {
+            'email': account.email, 'new_password': new_password, 'user_id': self.app_admin.pk,
+            **fields,
+        }
+        rejected = self.client.post('/api/password-reset/confirm/', {**payload, 'otp': otp + '0'}, format='json')
+        self.assertEqual(rejected.status_code, status.HTTP_400_BAD_REQUEST)
+        account.refresh_from_db()
+        self.assertTrue(account.check_password(self.password))
+        reset = self.client.post('/api/password-reset/confirm/', {**payload, 'otp': otp}, format='json')
+        self.assertEqual(reset.status_code, status.HTTP_200_OK, reset.data)
+        self.assertEqual(self.privilege_state(account), original)
+        self.assertTrue(account.check_password(new_password))
+        self.app_admin.refresh_from_db()
+        self.assertTrue(self.app_admin.check_password(self.password))
+        login = self.client.post('/api/token/', {'email': account.email, 'password': new_password}, format='json')
+        self.assertEqual(login.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.get('/api/orders/admin-all/').status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(WalletTransaction.objects.exists())
+
+    def test_profile_writes_only_validated_changes_and_preserves_the_wallet_ledger(self):
+        stale_profile = UserProfileUpdateSerializer(
+            self.customer, data={'username': 'updated-buyer', **self.privileged_fields()}, partial=True
+        )
+        self.assertTrue(stale_profile.is_valid(), stale_profile.errors)
+        self.assertEqual(stale_profile.validated_data, {'username': 'updated-buyer'})
+        self.assertTrue(all(field.read_only for field in UserSerializer().fields.values()))
+
+        gift_card = GiftCard.objects.create(initial_balance='25.00', current_balance='25.00')
+        self.client.force_authenticate(user=self.customer)
+        redeemed = self.client.post('/api/gift-cards/redeem/', {'gift_card_id': str(gift_card.pk)}, format='json')
+        self.assertEqual(redeemed.status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(user=self.app_admin)
+        promoted = self.client.patch(f'{self.user_urls[0]}{self.customer.pk}/', {'role': 'seller'}, format='json')
+        self.assertEqual(promoted.status_code, status.HTTP_200_OK)
+
+        stale_profile.save()
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.username, 'updated-buyer')
+        self.assertEqual(self.customer.role, 'seller')
+        self.assertEqual(self.customer.wallet_balance, Decimal('25.00'))
+        entry = WalletTransaction.objects.get(user=self.customer)
+        self.assertEqual(entry.transaction_type, 'CREDIT_GIFT_CARD')
+        self.assertEqual(entry.amount, Decimal('25.00'))
+        self.assertEqual(entry.balance_after, self.customer.wallet_balance)
+
+    def test_profile_password_and_contact_updates_follow_existing_checks(self):
+        self.client.force_authenticate(user=self.customer)
+        url = f'{self.user_urls[0]}{self.customer.pk}/'
+        otp_key = f'profile_otp_{self.customer.pk}'
+        cache.set(otp_key, '123456', timeout=300)
+        updated = self.client.patch(url, {
+            'username': 'updated-customer', 'phone': '5550100', 'otp': '123456',
+        }, format='multipart')
+        self.assertEqual(updated.status_code, status.HTTP_200_OK)
+        cache.set(otp_key, '123456', timeout=300)
+        payload = {'password': 'Replacement-Password-31!', 'current_password': self.password, 'otp': '123456'}
+        invalid = self.client.patch(url, {**payload, 'email': self.seller.email}, format='json')
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+        self.customer.refresh_from_db()
+        self.assertTrue(self.customer.check_password(self.password))
+        changed = self.client.patch(url, payload, format='json')
+        self.assertEqual(changed.status_code, status.HTTP_200_OK)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.username, 'updated-customer')
+        self.assertEqual(self.customer.phone, '5550100')
+        self.assertTrue(self.customer.check_password(payload['password']))
+
+    def test_django_admin_delegated_staff_cannot_grant_privileges(self):
+        add_user = Permission.objects.get(content_type__app_label='api', codename='add_user')
+        self.staff.user_permissions.add(add_user, self.change_user)
+        self.client.force_login(self.staff)
+        original = self.privilege_state(self.customer)
+        password_data = {
+            'password1': 'Replacement-Password-31!', 'password2': 'Replacement-Password-31!',
+        }
+        created = self.client.post('/admin/api/user/add/', {
+            **self.privileged_fields(), **password_data, 'username': 'staff-created',
+        }, secure=True)
+        self.assertEqual(created.status_code, status.HTTP_302_FOUND)
+        new_user = User.objects.get(username='staff-created')
+        self.assertEqual(self.privilege_state(new_user), original)
+        self.assertTrue(new_user.check_password(password_data['password1']))
+
+        date_joined = self.customer.date_joined
+        form_data = {
+            **self.privileged_fields(),
+            'username': self.customer.username, 'email': self.customer.email,
+            'is_active': 'on', 'phone': '5550100',
+            'date_joined_0': date_joined.date().isoformat(),
+            'date_joined_1': date_joined.time().isoformat(timespec='seconds'),
+        }
+        response = self.client.post(f'/admin/api/user/{self.customer.pk}/change/', form_data, secure=True)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(self.privilege_state(self.customer), original)
+        self.assertEqual(self.customer.phone, '5550100')
+        changed = self.client.post(f'/admin/api/user/{self.customer.pk}/password/', {
+            **self.privileged_fields(), **password_data,
+        }, secure=True)
+        self.assertEqual(changed.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(self.privilege_state(self.customer), original)
+        self.assertTrue(self.customer.check_password(password_data['password1']))
+        for target in (self.staff, self.app_admin, self.django_admin):
+            with self.subTest(target=target):
+                url = f'/admin/api/user/{target.pk}'
+                self.assertEqual(self.client.post(f'{url}/change/', form_data, secure=True).status_code, 403)
+                self.assertEqual(self.client.post(f'{url}/password/', password_data, secure=True).status_code, 403)
+
+        self.client.force_login(self.django_admin)
+        response = self.client.post(f'/admin/api/user/{self.customer.pk}/change/', form_data, secure=True)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.role, 'admin')
+        self.assertTrue(self.customer.is_staff)
+        self.assertTrue(self.customer.is_superuser)
+        self.assertEqual(list(self.customer.groups.values_list('pk', flat=True)), [self.group.pk])
+        self.assertEqual(list(self.customer.user_permissions.values_list('pk', flat=True)), [self.change_user.pk])
+        self.assertEqual(self.customer.wallet_balance, Decimal('0.00'))
+        self.assertFalse(WalletTransaction.objects.exists())
+
+    def test_django_admin_delegated_staff_cannot_delete_privileged_users(self):
+        self.staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label='api', codename__in=['delete_user', 'view_user'],
+        ))
+        self.client.force_login(self.staff)
+        superuser_without_staff = User.objects.create_user(
+            username='superuser-only', email='superuser-only@example.invalid', is_superuser=True,
+        )
+        for target in (self.staff, self.app_admin, self.django_admin, superuser_without_staff):
+            with self.subTest(target=target):
+                direct = self.client.post(f'/admin/api/user/{target.pk}/delete/', {'post': 'yes'}, secure=True)
+                self.assertEqual(direct.status_code, status.HTTP_403_FORBIDDEN)
+                bulk = self.client.post('/admin/api/user/', {
+                    'action': 'delete_selected', '_selected_action': [target.pk, self.customer.pk], 'post': 'yes',
+                }, secure=True)
+                self.assertEqual(bulk.status_code, status.HTTP_403_FORBIDDEN)
+                self.assertTrue(User.objects.filter(pk=target.pk).exists())
+                self.assertTrue(User.objects.filter(pk=self.customer.pk).exists())
+
+        direct = self.client.post(f'/admin/api/user/{self.customer.pk}/delete/', {'post': 'yes'}, secure=True)
+        self.assertEqual(direct.status_code, status.HTTP_302_FOUND)
+        self.assertFalse(User.objects.filter(pk=self.customer.pk).exists())
+        bulk = self.client.post('/admin/api/user/', {
+            'action': 'delete_selected', '_selected_action': [self.seller.pk], 'post': 'yes',
+        }, secure=True)
+        self.assertEqual(bulk.status_code, status.HTTP_302_FOUND)
+        self.assertFalse(User.objects.filter(pk=self.seller.pk).exists())
+
+        self.client.force_login(self.django_admin)
+        direct = self.client.post(f'/admin/api/user/{self.app_admin.pk}/delete/', {'post': 'yes'}, secure=True)
+        self.assertEqual(direct.status_code, status.HTTP_302_FOUND)
+        self.assertFalse(User.objects.filter(pk=self.app_admin.pk).exists())
 
 
 class EazyShopTitaniumTestSuite(APITestCase):

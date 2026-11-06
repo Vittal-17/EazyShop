@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.forms import AdminPasswordChangeForm
 
 # Explicit imports are safer than *
 from .models import (
@@ -21,14 +22,51 @@ from .models import (
 )
 
 
+class UserAdminPasswordChangeForm(AdminPasswordChangeForm):
+    def save(self, commit=True):
+        user = super().save(commit=False)
+        if commit:
+            user.save(update_fields=['password'])
+        return user
+
+
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
+    change_password_form = UserAdminPasswordChangeForm
     list_display = ('username', 'email', 'role', 'is_staff', 'is_active')
     list_filter = ('role', 'is_staff', 'is_superuser')
     # Custom fieldsets ensure we don't break the default UserAdmin
     fieldsets = BaseUserAdmin.fieldsets + (
         (None, {'fields': ('role', 'phone')}),
     )
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = super().get_readonly_fields(request, obj)
+        if request.user.is_superuser:
+            return fields
+        return (*fields, 'role', 'is_staff', 'is_superuser', 'groups', 'user_permissions')
+
+    def _is_protected_user(self, request, obj):
+        return obj is not None and not request.user.is_superuser and (
+            obj.is_staff or obj.is_superuser or obj.role == 'admin'
+        )
+
+    def has_change_permission(self, request, obj=None):
+        if self._is_protected_user(request, obj):
+            return False
+        return super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        if self._is_protected_user(request, obj):
+            return False
+        return super().has_delete_permission(request, obj)
+
+    def save_model(self, request, obj, form, change):
+        if not change:
+            return super().save_model(request, obj, form, change)
+        changed_fields = set(form.changed_data) & {field.name for field in obj._meta.concrete_fields}
+        if changed_fields:
+            obj.save(update_fields=changed_fields)
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
