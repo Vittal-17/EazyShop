@@ -15,14 +15,16 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-import dj_database_url
-from decouple import config
+from .database import database_config
+from .environment import load_environment
 from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 IS_TESTING = 'test' in sys.argv
+# Explicit production opt-in is required even when process DATABASE_URL is remote.
+config, LOCAL_DATABASE = load_environment(BASE_DIR, testing=IS_TESTING)
 
 
 # Quick-start development settings - unsuitable for production
@@ -170,12 +172,13 @@ WSGI_APPLICATION = 'ecommerce_platform.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 DATABASES = {
-    'default': dj_database_url.config(
-        default=f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}",
-        conn_max_age=600,
-        conn_health_checks=True,
-    )
+    'default': database_config(
+        config('TEST_DATABASE_URL' if IS_TESTING else 'DATABASE_URL', default=''),
+        local=LOCAL_DATABASE, testing=IS_TESTING,
+    ),
 }
+if IS_TESTING:
+    TEST_RUNNER = 'ecommerce_platform.test_runner.IsolatedPostgresRunner'
 
 # 🚀 Distributed Cache Configuration (ARCH-01)
 REDIS_URL = config('REDIS_URL', default='')
@@ -336,3 +339,11 @@ STORAGES = {
 RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID')
 RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
 RAZORPAY_WEBHOOK_SECRET = config('RAZORPAY_WEBHOOK_SECRET')
+
+# Automated tests never use configured external email, cache or media services.
+if IS_TESTING:
+    EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+    CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+    STORAGES['default'] = {'BACKEND': 'django.core.files.storage.InMemoryStorage'}
+    RAZORPAY_KEY_ID = RAZORPAY_KEY_SECRET = RAZORPAY_WEBHOOK_SECRET = 'isolated-test-placeholder'
+    ANYMAIL = {**ANYMAIL, 'SENDINBLUE_API_KEY': 'isolated-test-placeholder'}

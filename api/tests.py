@@ -1412,44 +1412,6 @@ class EazyShopTitaniumTestSuite(APITestCase):
 # PHASE 19: FIN-01/05/09/13 — AUTHORITATIVE PRICING, STOCK, IDEMPOTENCY
 # ==========================================
 class Phase19FinancialSecurityTests(APITestCase):
-    # Concurrency tests require a row-level locking DB (PostgreSQL). SQLite
-    # raises OperationalError: database is locked under threading. Run these
-    # against the real Neon backend by pointing DATABASE_URL at production.
-    def _run_concurrent_stock_test(self, stock, qty, expected_ok, name):
-        """Generic concurrent stock contention test for Postgres-backed DBs."""
-        from django.db import connection
-        if connection.vendor != 'postgresql':
-            self.skipTest(f"Concurrency test '{name}' requires PostgreSQL (row-level locking). "
-                          "Set DATABASE_URL to the Neon endpoint and rerun to exercise it.")
-
-        scarce = Product.objects.create(name=name, price=Decimal('100.00'), stock=stock,
-                                        category=self.category, approval_status='approved', is_active=True,
-                                        vendor=self.seller)
-        mock = MagicMock()
-        mock.order.create.return_value = {'id': 'o', 'amount': qty * 100, 'currency': 'INR'}
-
-        results = []
-        from concurrent.futures import ThreadPoolExecutor
-
-        def place_order():
-            with patch('razorpay.Client', return_value=mock):
-                return self.client.post(self.order_url, {
-                    "shipping_address": "addr", "contact_phone": "111",
-                    "total_price": f"{qty * 100:.2f}",
-                    "order_items": [{"product": scarce.id, "quantity": qty}]
-                }, format='json')
-
-        with ThreadPoolExecutor(max_workers=50) as ex:
-            results = list(ex.map(place_order))
-        created = [r for r in results if r.status_code == status.HTTP_201_CREATED]
-        denied = [r for r in results if r.status_code == status.HTTP_400_BAD_REQUEST]
-        self.assertEqual(len(created), expected_ok,
-                         f"{name}: exactly {expected_ok} order(s) must succeed under stock contention")
-        self.assertGreaterEqual(len(denied), 1, f"{name}: at least one contender must be rejected")
-        scarce.refresh_from_db()
-        self.assertEqual(scarce.stock, stock - (expected_ok * qty),
-                         f"{name}: stock must reflect only winning orders, no negatives")
-        self.assertEqual(Order.objects.count(), expected_ok)
     def setUp(self):
         # Force threaded calls (like emails) to run synchronously in tests
         patcher = patch('threading.Thread.start', new=lambda self: self._target(*self._args, **self._kwargs) if self._target else None)
@@ -1517,17 +1479,6 @@ class Phase19FinancialSecurityTests(APITestCase):
                 "order_items": [{"product": low_stock.id, "quantity": 5}]  # want 5, have 1
             }, format='json')
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    # --- FIN-09: Stock starvation under concurrent requests ---
-    def test_fin09_stock_starvation(self):
-        """Simulate 100 concurrent shoppers for stock=1: exactly 1 order succeeds, stock=0, no negatives."""
-        self.client.force_authenticate(user=self.customer)
-        self._run_concurrent_stock_test(stock=1, qty=1, expected_ok=1, name="stock=1, qty=1 (flash sale)")
-
-    def test_fin09_concurrent_rollback(self):
-        """Two requests for stock=2 in parallel: exactly one succeeds; final stock=0, no negative."""
-        self.client.force_authenticate(user=self.customer)
-        self._run_concurrent_stock_test(stock=2, qty=2, expected_ok=1, name="stock=2, qty=2")
 
     def test_fin13_idempotency_key(self):
         """Retrying an order with the same idempotency key must return cached replay without duplicate."""

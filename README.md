@@ -75,7 +75,7 @@ EazyShop **v1.8.0** delivers a major upgrade introducing a unified financial eng
 
 ### Backend
 - **Framework:** Django 5.2 & Django REST Framework 3.16
-- **Database:** PostgreSQL (Neon Serverless) / SQLite (Development)
+- **Database:** PostgreSQL 18 (local Docker Compose); PostgreSQL/Neon in production
 - **Authentication:** `djangorestframework-simplejwt` (HTTP-Only Cookies)
 - **Payment Gateway:** Razorpay SDK 2.0.1
 - **Media Storage:** Cloudinary (`django-cloudinary-storage`)
@@ -144,7 +144,7 @@ EazyShop/
 ### Prerequisites
 - **Python:** 3.12 or newer
 - **Node.js:** 18.x or newer & npm
-- **Database:** PostgreSQL or SQLite
+- **Database:** Docker Engine + Compose for local PostgreSQL 18
 
 ---
 
@@ -167,22 +167,32 @@ EazyShop/
    pip install -r requirements.txt
    ```
 
-4. **Configure environment variables:**
+4. **Create isolated local database credentials and back up legacy SQLite:**
    ```bash
-   cp .env.example .env
-   # Edit .env with your PostgreSQL, Razorpay, Cloudinary, and Brevo credentials
+   python scripts/setup_local_db.py --port 5433
+   docker compose --env-file .env.postgres up -d --wait
    ```
+   Choose a free port (this workstation uses **5434**, since 5433 is occupied).
+   The setup creates ignored `.env.local`, `.env.test`, and `.env.postgres` files.
+   It never overwrites existing credential files or the SQLite database.
+   Ordinary local commands require `.env.local`; they never fall back to `.env`.
+   Remote deployments must explicitly set `EAZYSHOP_RUNTIME=production`; see the
+   runbook for environment-only deployments and deliberate file selection.
 
-5. **Run database migrations:**
+5. **Apply existing migrations to local PostgreSQL:**
    ```bash
-   python manage.py migrate
+   python manage.py migrate --noinput
    ```
+   See [the PostgreSQL runbook](docs/local-postgresql.md) for isolation, backup,
+   restore, optional legacy-data import, testing, production configuration and rollback.
 
 6. **Start the development server:**
    ```bash
    python manage.py runserver
    ```
-   Backend will be available at `http://127.0.0.1:8000/`.
+   Backend will be available at `http://127.0.0.1:8000/`. If occupied, use
+   `python manage.py runserver 127.0.0.1:8002` and point React's
+   `REACT_APP_API_URL` at that address, using the same loopback hostname.
 
 ---
 
@@ -211,12 +221,16 @@ EazyShop/
 EazyShop includes the **Titanium Test Suite** with 68 comprehensive unit and integration tests covering security, role isolation, inventory atomicity, Razorpay webhooks, and gift card race conditions.
 
 ```bash
-# Run the complete test suite
+# Run against the isolated, pre-created PostgreSQL test database
 python manage.py test
 
 # Run tests with verbose output
 python manage.py test -v 2
 ```
+
+The test runner uses `.env.test`, blocks external provider networking, preserves
+the dedicated test database and rejects concurrent suite runs. Never point tests
+at Neon or a development database. PostgreSQL concurrency tests run without skips.
 
 To run frontend component tests:
 ```bash
