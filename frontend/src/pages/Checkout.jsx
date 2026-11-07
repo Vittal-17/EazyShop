@@ -10,6 +10,7 @@ import { SkeletonRow } from '../components/SkeletonLoader';
 import { PageHeader, GlowingPageContainer } from '../styles/SharedPageStyles';
 import AppLayout from '../components/AppLayout';
 import { formatINR } from '../utils/currency';
+import { purchaseKey, clearPurchaseKey } from '../utils/purchaseKey';
 import { loadRazorpay } from '../utils/loadRazorpay';
 
 const Checkout = () => {
@@ -91,6 +92,7 @@ const Checkout = () => {
       }));
 
       const orderRes = await axiosInstance.post('/api/orders/create-razorpay-order/', {
+        idempotency_key: purchaseKey('merchandise', user.id),
         shipping_address: addressSnapshot,
         contact_phone: contactPhone,
         total_price: payloadTotalPrice,
@@ -102,7 +104,8 @@ const Checkout = () => {
 
       // 🚀 SCENARIO B: FULLY COVERED BY WALLET (BYPASS RAZORPAY)
       if (orderData.payment_complete) {
-        toast.success('🎉 Order fully paid using Wallet Balance!');
+        clearPurchaseKey('merchandise', user.id);
+        toast.success('Order payment confirmed.');
         isSubmittingRef.current = false;
         setLoading(false);
         navigate(`/order-success/${orderData.order_id}`, {
@@ -117,6 +120,8 @@ const Checkout = () => {
       }
 
       // 🚀 SCENARIO A: PARTIAL OR NO GIFT CARD (PROCEED TO RAZORPAY)
+      let attemptFailed = false;
+      let capturePending = false;
       const options = {
         key: orderData.key_id,
         amount: orderData.amount,
@@ -125,6 +130,7 @@ const Checkout = () => {
         description: "Secure Order Checkout",
         order_id: orderData.razorpay_order_id,
         handler: async function (response) {
+          capturePending = true;
           let timeoutHandle;
 
           // 45-Second Safety Timeout Guard
@@ -147,6 +153,7 @@ const Checkout = () => {
             clearTimeout(timeoutHandle);
 
             if (verifyRes.data.success) {
+              clearPurchaseKey('merchandise', user.id);
               isSubmittingRef.current = false;
               setLoading(false);
               toast.success('📦 Payment verified & Order placed successfully!');
@@ -183,10 +190,17 @@ const Checkout = () => {
           ondismiss: async function() {
             isSubmittingRef.current = false;
             setLoading(false);
+            if (capturePending || attemptFailed) {
+              toast.error(capturePending
+                ? 'Payment confirmation is unresolved. Check your order before paying again.'
+                : 'This attempt failed. Retry checkout to resume the same purchase.');
+              return;
+            }
             toast("Payment cancelled by user", { icon: '⚠️' });
 
             try {
               await axiosInstance.post(`/api/orders/${orderData.order_id}/cancel/`);
+              clearPurchaseKey('merchandise', user.id);
             } catch (cancelErr) {
               console.error('Failed to cancel abandoned order:', cancelErr);
             }
@@ -196,8 +210,12 @@ const Checkout = () => {
 
       const rzp = new window.Razorpay(options);
 
-      rzp.on('payment.failed', function (response) {
-        console.warn("Payment failed at gateway:", response.error.description);
+      rzp.on('payment.failed', function () {
+        if (capturePending) return; // A reordered failure must not erase an unresolved capture.
+        attemptFailed = true;
+        isSubmittingRef.current = false;
+        setLoading(false);
+        toast.error('Payment attempt failed. You can retry this same purchase.');
       });
 
       rzp.open();
@@ -205,7 +223,7 @@ const Checkout = () => {
     } catch (err) {
       isSubmittingRef.current = false;
       setLoading(false);
-      const serverMsg = err.response?.data?.message || err.response?.data?.detail || 'Failed to initialize payment';
+      const serverMsg = err.response?.data?.error || err.response?.data?.message || err.response?.data?.detail || 'Failed to initialize payment';
       toast.error(`❌ ${serverMsg}`);
     }
   };

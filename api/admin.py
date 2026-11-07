@@ -163,5 +163,12 @@ class CartAdmin(admin.ModelAdmin):
 class CartItemAdmin(admin.ModelAdmin):
     list_display = ('cart', 'product', 'quantity')
     search_fields = ('product__name', 'cart__user__username')
-admin.site.register(GiftCard)
-admin.site.register(GiftCardTransaction)
+admin.site.register(GiftCard, CommerceRecordAdmin)
+admin.site.register(GiftCardTransaction, CommerceRecordAdmin)
+from .models import PurchaseIntent, ProviderPaymentClaim, ProviderEvent
+admin.site.register(PurchaseIntent, CommerceRecordAdmin)
+admin.site.register(ProviderPaymentClaim, CommerceRecordAdmin)
+admin.site.register(ProviderEvent, CommerceRecordAdmin)
+
+from .models import ProviderRefund
+admin.site.register(ProviderRefund, CommerceRecordAdmin)

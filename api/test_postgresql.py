@@ -61,8 +61,8 @@ class PostgresStockConcurrencyTests(TransactionTestCase):
                 connections.close_all()
 
         with patch('api.views.razorpay.Client') as gateway, patch('api.views.async_notify_vendors'):
-            gateway.return_value.order.create.side_effect = lambda payload: {
-                'id': 'order_' + uuid.uuid4().hex, 'amount': payload['amount'], 'currency': 'INR',
+            gateway.return_value.order.create.side_effect = lambda data, **kwargs: {
+                'id': 'order_' + uuid.uuid4().hex, 'amount': data['amount'], 'currency': 'INR',
             }
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 results = list(executor.map(place_order, buyers))

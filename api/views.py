@@ -9,8 +9,6 @@ from api.utils.async_tasks import run_async
 import razorpay
 from decimal import Decimal
 
-import qrcode
-import cloudinary.uploader
 import io
 import uuid
 
@@ -65,8 +63,11 @@ from .email_service import (
     send_vendor_new_order_email,
     async_notify_vendors
 )
+from .purchase_requests import merchandise_terms, gift_terms, request_fingerprint, request_conflict
 from .fulfillment import fulfill_order
-from .settlement import record_gateway_capture
+from .refunds import fetch_refund_payment, record_processed_refund
+from .settlement import (record_gateway_capture, create_provider_order, checkout_response,
+    settle_gift_capture, gift_response, validate_wallet)
 from .models import (
     Address,
     AdminLog,
@@ -84,6 +85,7 @@ from .models import (
     GiftCard,
     GiftCardTransaction,
     WalletTransaction,
+    PurchaseIntent, ProviderPaymentClaim, ProviderEvent,
     record_wallet_transaction,
 )
 from .permissions import (
@@ -677,9 +679,27 @@ class OrderViewSet(
             if order.status not in ['pending', 'pending_payment', 'paid', 'processing']:
                 return Response({"error": "Cannot cancel non-pending order."}, status=status.HTTP_400_BAD_REQUEST)
 
+            intent = PurchaseIntent.objects.select_for_update().filter(order=order, purpose='merchandise').first()
+            if not intent:
+                return Response({'error': 'Historical purchase requires reconciliation before cancellation.'}, status=409)
+            if ProviderPaymentClaim.objects.filter(intent=intent, refunds__isnull=False).exists():
+                return Response({'error': 'Processed refunds require reconciliation before cancellation.'}, status=409)
+            try:
+                validate_wallet(intent, order)
+                for payment in order.payment.filter(status='completed').exclude(payment_method='wallet'):
+                    if not payment.verified_at or not ProviderPaymentClaim.objects.filter(
+                        payment_id=payment.transaction_id, intent=intent, state='captured',
+                        amount=int(payment.amount * 100), currency=intent.currency,
+                    ).exists():
+                        raise ModelValidationError('Payment lacks trusted claim evidence.')
+            except ModelValidationError:
+                return Response({'error': 'Purchase requires reconciliation before cancellation.'}, status=409)
+
             order.status = 'cancelled'
             order.save(update_fields=['status'])
 
+            # Match checkout's user-before-products lock order.
+            User.objects.select_for_update().get(pk=order.user_id)
             # Deterministic product locking in ascending ID order to eliminate deadlocks
             order_items = list(order.order_items.select_related('product').all())
             items_to_restock = [it for it in order_items if it.product and it.status != 'cancelled']
@@ -734,6 +754,7 @@ class OrderViewSet(
                 if gp.transaction_id:
                     gp.status = 'refund_pending'
                     gp.save(update_fields=['status'])
+                    ProviderPaymentClaim.objects.filter(payment_id=gp.transaction_id).update(state='refund_pending')
                     gateway_refunds_to_process.append({
                         'payment_id': gp.id,
                         'transaction_id': gp.transaction_id,
@@ -757,11 +778,16 @@ class OrderViewSet(
                         'amount': int(amount * 100),
                         'notes': {'order_id': str(ord_id), 'reason': 'Order cancelled by customer'}
                     }
-                    client.payment.refund(tx_id, refund_data)
-                    Payment.objects.filter(id=gp_id).update(status='refunded')
+                    refund = client.payment.refund(tx_id, refund_data, timeout=5)
+                    if refund.get('status') == 'processed':
+                        if refund.get('payment_id') != tx_id:
+                            raise ModelValidationError('Refund response is not bound to the requested payment.')
+                        record_processed_refund(refund, fetch_refund_payment(client, refund))
+                    # A pending/unknown response remains reserved for the signed webhook.
+
                 except Exception as refund_err:
                     logger.error(f"[GATEWAY REFUND ERROR] Failed to refund {tx_id}: {refund_err}")
-                    Payment.objects.filter(id=gp_id).update(status='refund_failed')
+                    Payment.objects.filter(id=gp_id, status='refund_pending').update(status='refund_failed')
 
         if getattr(request.user, 'role', '') == 'admin' or request.user.is_staff:
             log_admin_action(request.user, f"Cancelled Order #{order.id}")
@@ -784,17 +810,11 @@ class OrderViewSet(
         - Stock is RESERVED atomically BEFORE calling the payment gateway.
         """
         idem_key = get_idempotency_key(request)
-        if idem_key and request.user.is_authenticated:
-            cached_res, lock_acquired = check_idempotency(request.user.id, "create_razorpay_order", idem_key)
-            if cached_res:
-                return Response(cached_res['data'], status=cached_res['status'])
-            if not lock_acquired:
-                return Response(
-                    {"error": "A request with this idempotency key is already in progress."},
-                    status=status.HTTP_409_CONFLICT
-                )
+        if idem_key and len(idem_key) > 128:
+            return Response({'error': 'Idempotency key is too long.'}, status=400)
 
-        use_wallet = request.data.get('use_wallet') == True
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
         order_items_input = request.data.get('order_items', [])
 
         # --- INPUT VALIDATION (before any DB work) ---
@@ -818,12 +838,11 @@ class OrderViewSet(
                 )
             item_qty_map[p_id] = item_qty_map.get(p_id, 0) + qty
 
-        if not request.data.get('shipping_address'):
-            release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
-            return Response({"error": "Shipping address is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not request.data.get('contact_phone'):
-            release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
-            return Response({"error": "Contact phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            terms = merchandise_terms(request.data, item_qty_map)
+        except ModelValidationError as exc:
+            return Response({'error': exc.messages[0]}, status=400)
+        use_wallet = terms['use_wallet']
 
         # --- SERVER-AUTHORITATIVE PRICING & STOCK LOCK ---
         sorted_product_ids = sorted(item_qty_map.keys())
@@ -831,6 +850,17 @@ class OrderViewSet(
         with transaction.atomic():
             # Lock the user FIRST (wallet race guard)
             user = User.objects.select_for_update().get(id=request.user.id)
+
+            if idem_key:
+                previous = PurchaseIntent.objects.filter(purchaser=user, purpose='merchandise', idempotency_key=idem_key).first()
+                if previous:
+                    conflict = request_conflict(previous, terms)
+                    if conflict:
+                        return Response(conflict, status=409)
+                    try:
+                        return Response(checkout_response(previous), status=201)
+                    except ModelValidationError:
+                        return Response({'error': 'Purchase requires reconciliation.', 'intent_id': previous.pk}, status=409)
 
             # Lock all requested products in a DETERMINISTIC order (sorted IDs)
             # Deterministic lock ordering = deadlock freedom across concurrent requests
@@ -873,8 +903,8 @@ class OrderViewSet(
             # --- CREATE ORDER WITH SERVER-COMPUTED TOTAL (client price discarded) ---
             order = Order.objects.create(
                 user=user,
-                shipping_address=request.data.get('shipping_address'),
-                contact_phone=request.data.get('contact_phone'),
+                shipping_address=terms['shipping_address'],
+                contact_phone=terms['contact_phone'],
                 total_price=server_total_price,  # authoritative
                 status='pending_payment'
             )
@@ -891,12 +921,13 @@ class OrderViewSet(
             # --- WALLET LOGIC (server-computed, no client price input) ---
             remaining_amount = server_total_price
             wallet_deducted = Decimal('0.00')
+            wallet_debit = None
 
             if use_wallet and user.wallet_balance > 0:
                 if user.wallet_balance >= server_total_price:
                     # Full coverage by wallet — reserve immediately
                     wallet_deducted = server_total_price
-                    record_wallet_transaction(
+                    wallet_debit = record_wallet_transaction(
                         user=user,
                         amount=wallet_deducted,
                         transaction_type='DEBIT_ORDER',
@@ -914,6 +945,12 @@ class OrderViewSet(
                         verified_at=timezone.now()
                     )
 
+                    intent = PurchaseIntent.objects.create(
+                        purpose='merchandise', purchaser=user, order=order, expected_amount=0,
+                        wallet_amount=int(wallet_deducted * 100), wallet_debit=wallet_debit,
+                        state='settled', idempotency_key=idem_key or None,
+                        request_fingerprint=request_fingerprint(terms),
+                    )
                     # Fully paid via wallet — finalize
                     order.status = 'processing'
                     order.save(update_fields=['status'])
@@ -933,7 +970,7 @@ class OrderViewSet(
                 else:
                     # Partial coverage — reserve the wallet portion atomically (deduct now, reconcile on payment)
                     wallet_deducted = user.wallet_balance
-                    record_wallet_transaction(
+                    wallet_debit = record_wallet_transaction(
                         user=user,
                         amount=wallet_deducted,
                         transaction_type='DEBIT_ORDER',
@@ -955,40 +992,21 @@ class OrderViewSet(
             else:
                 remaining_amount = server_total_price
 
-        # --- PAYMENT GATEWAY OUTSIDE THE DB TRANSACTION ---
+            intent = PurchaseIntent.objects.create(
+                purpose='merchandise', purchaser=user, order=order,
+                expected_amount=int(remaining_amount * 100), wallet_amount=int(wallet_deducted * 100),
+                wallet_debit=wallet_debit, idempotency_key=idem_key or None,
+                request_fingerprint=request_fingerprint(terms),
+            )
+
         client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-        amount_in_paise = int(remaining_amount * 100)
-
-        notes = {
-            "django_order_id": order.id,
-            "server_total_price": str(server_total_price),  # server-authoritative, for reconciliation
-        }
-        if use_wallet and wallet_deducted > 0:
-            notes["wallet_deducted"] = str(wallet_deducted)
-            notes["wallet_deducted_txid"] = unique_txn_id
-
         try:
-            razorpay_order = client.order.create({
-                "amount": amount_in_paise,
-                "currency": "INR",
-                "payment_capture": 1,
-                "notes": notes
-            })
+            create_provider_order(intent, client)
         except Exception:
-            release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
-            raise
-
-        order.gateway_order_id = razorpay_order['id']
-        order.save(update_fields=['gateway_order_id'])
-        resp_data = {
-            "order_id": order.id,
-            "razorpay_order_id": razorpay_order['id'],
-            "amount": razorpay_order['amount'],
-            "currency": razorpay_order['currency'],
-            "key_id": settings.RAZORPAY_KEY_ID
-        }
-        store_idempotency_result(request.user.id, "create_razorpay_order", idem_key, resp_data, status.HTTP_201_CREATED)
-        return Response(resp_data, status=status.HTTP_201_CREATED)
+            logger.warning('Provider order outcome unknown for intent %s', intent.pk)
+            return Response({'error': 'Payment initialization requires reconciliation. Do not pay or create another purchase.',
+                             'intent_id': intent.pk, 'order_id': order.pk}, status=503)
+        return Response(checkout_response(intent), status=201)
 
     @action(detail=False, methods=['post'], url_path='verify-razorpay-payment')
     def verify_razorpay_payment(self, request):
@@ -1013,9 +1031,16 @@ class OrderViewSet(
                 order = Order.objects.select_for_update().filter(pk=order_id, user=request.user).first()
                 if not order or not order.gateway_order_id or order.gateway_order_id != gateway_order_id:
                     raise ModelValidationError("Payment does not match this order.")
+                intent = PurchaseIntent.objects.filter(order=order, purchaser=request.user, purpose='merchandise',
+                    provider_order_id=gateway_order_id).first()
+                if not intent or intent.state not in ('pending', 'settled'):
+                    raise ModelValidationError('Purchase lacks trusted settlement terms.')
+                claim = ProviderPaymentClaim.objects.filter(payment_id=payment_id).first()
+                if claim and (claim.intent_id != intent.pk or claim.state != 'captured'):
+                    raise ModelValidationError('Payment is unavailable for this purchase.')
                 payment = order.payment.filter(transaction_id=payment_id).first()
                 if payment and payment.verified_at:
-                    if payment.status != 'completed' or order.status not in Order.FULFILLABLE_STATUSES:
+                    if not claim or intent.state != 'settled' or payment.status != 'completed' or order.status not in Order.FULFILLABLE_STATUSES:
                         raise ModelValidationError("Payment is no longer settled.")
                     order.require_verified_settlement()
                     return Response({
@@ -1036,7 +1061,7 @@ class OrderViewSet(
                 'razorpay_payment_id': payment_id,
                 'razorpay_signature': signature,
             })
-            payment_details = client.payment.fetch(payment_id)
+            payment_details = client.payment.fetch(payment_id, timeout=5)
             if payment_details.get('id') != payment_id:
                 raise ModelValidationError("Payment ID does not match the gateway response.")
 
@@ -1062,7 +1087,7 @@ class OrderViewSet(
             return Response({"success": False, "message": "Invalid payment signature."}, status=status.HTTP_400_BAD_REQUEST)
         except Exception:
             logger.exception("Payment verification failed")
-            return Response({"success": False, "message": "Payment verification failed."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"success": False, "message": "Payment outcome is unknown. Retry this same purchase."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1508,331 +1533,205 @@ from django.views.decorators.csrf import csrf_exempt
 
 @csrf_exempt
 def razorpay_webhook(request):
-    if request.method == "POST":
-        webhook_secret = settings.RAZORPAY_WEBHOOK_SECRET
-        webhook_signature = request.headers.get('X-Razorpay-Signature', '')
-
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
-        try:
-            client.utility.verify_webhook_signature(
-                request.body.decode('utf-8'),
-                webhook_signature,
-                webhook_secret
-            )
-        except razorpay.errors.SignatureVerificationError:
-            return HttpResponse(status=400)
-
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+    try:
+        client.utility.verify_webhook_signature(request.body.decode('utf-8'),
+            request.headers.get('X-Razorpay-Signature', ''), settings.RAZORPAY_WEBHOOK_SECRET)
         payload = json.loads(request.body)
+        if not isinstance(payload, dict):
+            raise ValueError()
         event = payload.get('event')
-        payment_entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
-        order_entity = payload.get('payload', {}).get('order', {}).get('entity', {})
-        refund_entity = payload.get('payload', {}).get('refund', {}).get('entity', {})
-
-        refund_payment_id = refund_entity.get('payment_id')
-        refunded_capture = None
-        if event == 'refund.processed' and refund_payment_id:
-            existing_payment = Payment.objects.filter(transaction_id=refund_payment_id).exclude(
-                payment_method='wallet'
-            ).first()
-            if existing_payment:
-                order_lookup = {'pk': existing_payment.order_id}
-            else:
-                # A refund event can arrive before the capture event. Resolve it using
-                # the provider's payment record and leave a terminal payment record.
-                try:
-                    refunded_capture = client.payment.fetch(refund_payment_id, timeout=5)
-                except Exception:
-                    logger.exception("Could not resolve a Razorpay refund to its order")
-                    return HttpResponse(status=503)
-                if (
-                    refunded_capture.get('id') != refund_payment_id
-                    or refunded_capture.get('currency') != 'INR'
-                    or not refunded_capture.get('order_id')
-                    or type(refunded_capture.get('amount')) is not int
-                    or refunded_capture['amount'] <= 0
-                ):
-                    return HttpResponse(status=400)
-                order_lookup = {'gateway_order_id': refunded_capture['order_id']}
-        elif event in ('payment.captured', 'order.paid', 'payment.authorized', 'payment.failed'):
-            gateway_order_id = payment_entity.get('order_id')
-            if not gateway_order_id:
-                return HttpResponse(status=200)
-            if event == 'order.paid' and order_entity.get('id') != gateway_order_id:
-                return HttpResponse(status=400)
-            order_lookup = {'gateway_order_id': gateway_order_id}
-        else:
-            return HttpResponse(status=200)
-
-        late_capture = None
-        with transaction.atomic():
-            order = Order.objects.select_for_update().filter(**order_lookup).first()
-            if order:
-                if event in ('payment.captured', 'order.paid'):
-                    try:
-                        payment, finalized = record_gateway_capture(order, payment_entity)
-                    except ModelValidationError as exc:
-                        logger.warning("Rejected Razorpay capture for order %s: %s", order.pk, exc)
-                        return HttpResponse(status=400)
-                    if finalized:
-                        if order.status == 'cancelled':
-                            late_capture = (payment.pk, payment.transaction_id, payment.amount, order.pk)
-                        else:
-                            transaction.on_commit(lambda: async_notify_vendors(order))
-
-                elif event == 'payment.authorized':
-                    transaction_id = payment_entity.get('id')
-                    amount = payment_entity.get('amount')
-                    method = payment_entity.get('method', 'razorpay')
-                    if transaction_id and type(amount) is int and amount > 0 and method != 'wallet':
-                        Payment.objects.get_or_create(transaction_id=transaction_id, defaults={
-                            'order': order, 'payment_method': method, 'amount': Decimal(amount) / 100,
-                            'status': 'authorized',
-                        })
-
-                # 4. REFUND PROCESSED (Gateway automated refund event)
-                elif event == 'refund.processed':
-                    if refunded_capture:
-                        payment, _ = Payment.objects.get_or_create(transaction_id=refund_payment_id, defaults={
-                            'order': order, 'amount': Decimal(refunded_capture['amount']) / 100, 'status': 'refunded',
-                        })
-                        if payment.order_id != order.pk or payment.payment_method == 'wallet':
-                            return HttpResponse(status=400)
-                    order.payment.filter(transaction_id=refund_payment_id).exclude(payment_method='wallet').update(status='refunded')
-
-                    if order.status in ('pending', 'pending_payment', 'paid', 'processing'):
-                        order.status = 'cancelled'
-                        order.save(update_fields=['status'])
-
-                        sorted_product_ids = sorted(list({
-                            it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
-                        }))
-                        locked_products = {
-                            p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
-                        } if sorted_product_ids else {}
-
-                        for item in order.order_items.all():
-                            if item.status != 'cancelled':
-                                item.status = 'cancelled'
-                                item.save(update_fields=['status'])
-                                if item.product_id and item.product_id in locked_products:
-                                    product = locked_products[item.product_id]
-                                    product.stock += item.quantity
-                                    product.save(update_fields=['stock'])
-
-                        wallet_payments = Payment.objects.select_for_update().filter(
-                            order=order,
-                            payment_method='wallet',
-                            status='completed'
-                        )
-                        if wallet_payments.exists():
-                            order_user = User.objects.select_for_update().get(id=order.user_id)
-                            for wp in wallet_payments:
-                                record_wallet_transaction(
-                                    user=order_user,
-                                    amount=wp.amount,
-                                    transaction_type='REFUND_ORDER',
-                                    reference_id=f"ORDER-{order.id}",
-                                    description=f"Refunded wallet payment for Refunded Order #{order.id}"
-                                )
-                                wp.status = 'refunded'
-                                wp.save(update_fields=['status'])
-
-                # 5. PAYMENT FAILED (Declined / Dropped)
-                elif event == 'payment.failed':
-                    if order.status in ['pending', 'pending_payment']:
-                        order.status = 'cancelled'
-                        order.save(update_fields=['status'])
-
-                        sorted_product_ids = sorted(list({
-                            it.product_id for it in order.order_items.all() if it.product_id and it.status != 'cancelled'
-                        }))
-                        locked_products = {
-                            p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
-                        } if sorted_product_ids else {}
-
-                        for item in order.order_items.all():
-                            if item.status != 'cancelled':
-                                item.status = 'cancelled'
-                                item.save(update_fields=['status'])
-                                if item.product_id and item.product_id in locked_products:
-                                    product = locked_products[item.product_id]
-                                    product.stock += item.quantity
-                                    product.save(update_fields=['stock'])
-
-                        # Restore reserved wallet payment if any
-                        wallet_payments = Payment.objects.select_for_update().filter(
-                            order=order,
-                            payment_method='wallet',
-                            status='completed'
-                        )
-                        if wallet_payments.exists():
-                            order_user = User.objects.select_for_update().get(id=order.user_id)
-                            for wp in wallet_payments:
-                                record_wallet_transaction(
-                                    user=order_user,
-                                    amount=wp.amount,
-                                    transaction_type='REFUND_ORDER',
-                                    reference_id=f"ORDER-{order.id}",
-                                    description=f"Refunded wallet payment for Failed Order #{order.id}"
-                                )
-                                wp.status = 'refunded'
-                                wp.save(update_fields=['status'])
-
-        if late_capture:
-            payment_pk, transaction_id, amount, order_pk = late_capture
-            try:
-                client.payment.refund(transaction_id, {
-                    'amount': int(amount * 100),
-                    'notes': {'order_id': str(order_pk), 'reason': 'Capture after order cancellation'},
-                })
-            except Exception:
-                logger.exception("Late capture refund failed for order %s", order_pk)
-                Payment.objects.filter(pk=payment_pk, status='refund_pending').update(status='refund_failed')
-
+        payment = payload.get('payload', {}).get('payment', {}).get('entity', {})
+        refund = payload.get('payload', {}).get('refund', {}).get('entity', {})
+        if not isinstance(payment, dict) or not isinstance(refund, dict):
+            raise ValueError()
+    except (razorpay.errors.SignatureVerificationError, ValueError, AttributeError):
+        return HttpResponse(status=400)
+    if event not in ('payment.captured', 'order.paid', 'payment.authorized', 'payment.failed', 'refund.processed'):
         return HttpResponse(status=200)
-    return HttpResponse(status=405)
+    import hashlib
+    inbox, _ = ProviderEvent.objects.get_or_create(fingerprint=hashlib.sha256(request.body).hexdigest(), defaults={
+        'event': event, 'payment_id': str(payment.get('id') or refund.get('payment_id') or '')[:100],
+        'provider_order_id': str(payment.get('order_id') or '')[:100],
+    })
+    # Do not shortcut on inbox state: revalidate durable financial state on every delivery.
+    try:
+        if event == 'refund.processed':
+            record_processed_refund(refund, fetch_refund_payment(client, refund))
+            response = HttpResponse(status=200)
+        else:
+            response = _process_gift_event(client, payload)
+            if response is None:
+                response = _process_merchandise_event(client, payload)
+    except ModelValidationError:
+        response = HttpResponse(status=400)
+    except Exception:
+        logger.exception('Provider event %s requires reconciliation', inbox.pk)
+        response = HttpResponse(status=503)
+    inbox.state = 'processed' if response.status_code == 200 else 'reconciliation'
+    inbox.save(update_fields=['state', 'updated_at'])
+    return response
+
+
+def _process_gift_event(client, payload):
+    event = payload['event']
+    entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
+    provider_id = entity.get('order_id')
+    if not isinstance(provider_id, str) or not provider_id:
+        return HttpResponse(status=400)
+    intent = PurchaseIntent.objects.filter(provider_order_id=provider_id).first()
+    if not intent or intent.purpose != 'gift_card':
+        return None
+    if event in ('payment.captured', 'order.paid'):
+        if event == 'order.paid' and payload.get('payload', {}).get('order', {}).get('entity', {}).get('id') != intent.provider_order_id:
+            return HttpResponse(status=400)
+        try:
+            card, _ = settle_gift_capture(intent.pk, entity)
+            return HttpResponse(status=200 if card else 503)
+        except ModelValidationError:
+            return HttpResponse(status=409)
+    # Failed/authorized are attempt observations in ProviderEvent, not purchase transitions.
+    return HttpResponse(status=200)
+
+
+def _process_merchandise_event(client, payload):
+    event = payload.get('event')
+    payment_entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
+    order_entity = payload.get('payload', {}).get('order', {}).get('entity', {})
+    gateway_order_id = payment_entity.get('order_id')
+    if not isinstance(gateway_order_id, str) or not gateway_order_id:
+        return HttpResponse(status=400)
+    if event == 'order.paid' and order_entity.get('id') != gateway_order_id:
+        return HttpResponse(status=400)
+    order_lookup = {'gateway_order_id': gateway_order_id}
+
+    late_capture = None
+    with transaction.atomic():
+        order = Order.objects.select_for_update().filter(**order_lookup).first()
+        if not order:
+            return HttpResponse(status=503)
+        if order:
+            User.objects.select_for_update().get(pk=order.user_id)
+            intent = PurchaseIntent.objects.select_for_update().filter(order=order, purpose='merchandise').first()
+            if not intent:
+                return HttpResponse(status=409)
+            try:
+                validate_wallet(intent, order)
+            except ModelValidationError:
+                return HttpResponse(status=409)
+            if event in ('payment.captured', 'order.paid'):
+                try:
+                    payment, finalized = record_gateway_capture(order, payment_entity)
+                except ModelValidationError as exc:
+                    logger.warning("Rejected Razorpay capture for order %s: %s", order.pk, exc)
+                    return HttpResponse(status=400)
+                if finalized:
+                    if order.status == 'cancelled':
+                        late_capture = (payment.pk, payment.transaction_id, payment.amount, order.pk)
+                    else:
+                        transaction.on_commit(lambda: async_notify_vendors(order))
+
+            # payment.authorized/payment.failed are recorded in ProviderEvent only.
+            # A delayed capture for this provider order remains eligible.
+
+    if late_capture:
+        payment_pk, transaction_id, amount, order_pk = late_capture
+        try:
+            client.payment.refund(transaction_id, {
+                'amount': int(amount * 100),
+                'notes': {'order_id': str(order_pk), 'reason': 'Capture after order cancellation'},
+            }, timeout=5)
+        except Exception:
+            logger.exception("Late capture refund failed for order %s", order_pk)
+            Payment.objects.filter(pk=payment_pk, status='refund_pending').update(status='refund_failed')
+
+    return HttpResponse(status=200)
 
 
 class GiftCardPurchaseView(APIView):
     permission_classes = [IsAuthenticated]
 
+    def get(self, request):
+        # Recover an interrupted response, only for the original authenticated buyer.
+        intents = PurchaseIntent.objects.filter(purchaser=request.user, purpose='gift_card').select_related('gift_card').order_by('-created_at')[:100]
+        return Response([{'intent_id': i.pk, 'state': i.state, 'idempotency_key': i.idempotency_key,
+                         **(gift_response(i.gift_card) if i.state == 'settled' and i.gift_card_id else {})} for i in intents])
+
     def post(self, request):
-        amount = request.data.get('amount')
-        if not amount:
-            return Response({'error': 'Amount is required'}, status=status.HTTP_400_BAD_REQUEST)
-
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
         try:
-            amount = Decimal(str(amount))
-        except:
-            return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+            amount = Decimal(str(request.data.get('amount')))
+            if not amount.is_finite() or not 0 < amount <= Decimal('99999999.99') or amount * 100 != int(amount * 100):
+                raise ValueError()
+            key = get_idempotency_key(request)
+            if key and len(key) > 128:
+                raise ValueError()
+        except Exception:
+            return Response({'error': 'A positive amount with at most two decimal places is required.'}, status=400)
+        terms = gift_terms(int(amount * 100))
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=request.user.pk)
+            previous = PurchaseIntent.objects.filter(purchaser=user, purpose='gift_card', idempotency_key=key).first() if key else None
+            if previous:
+                conflict = request_conflict(previous, terms)
+                if conflict:
+                    return Response(conflict, status=409)
+                try:
+                    return Response(checkout_response(previous))
+                except ModelValidationError:
+                    return Response({'error': 'Purchase already finalized or requires reconciliation.', 'intent_id': previous.pk}, status=409)
+            intent = PurchaseIntent.objects.create(purpose='gift_card', purchaser=user,
+                expected_amount=int(amount * 100), idempotency_key=key or None,
+                request_fingerprint=request_fingerprint(terms))
+        try:
+            create_provider_order(intent, razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)))
+            return Response(checkout_response(intent))
+        except Exception:
+            return Response({'error': 'Payment initialization requires reconciliation. Do not retry with a new key.',
+                             'intent_id': intent.pk}, status=503)
 
-        # Create Razorpay order
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-        order_data = {
-            'amount': int(amount * 100),
-            'currency': 'INR',
-            'receipt': f'gc_receipt_{request.user.id}'
-        }
-        rzp_order = client.order.create(data=order_data)
-
-        return Response({
-            'order_id': rzp_order['id'],
-            'amount': amount,
-            'key': settings.RAZORPAY_KEY_ID
-        }, status=status.HTTP_200_OK)
 
 class GiftCardVerifyPurchaseView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        idem_key = get_idempotency_key(request)
-        if idem_key and request.user.is_authenticated:
-            cached_res, lock_acquired = check_idempotency(request.user.id, "giftcard_verify", idem_key)
-            if cached_res:
-                return Response(cached_res['data'], status=cached_res['status'])
-            if not lock_acquired:
-                return Response(
-                    {"error": "A transaction with this idempotency key is already processing."},
-                    status=status.HTTP_409_CONFLICT
-                )
-
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_signature = request.data.get('razorpay_signature')
-        client_amount = request.data.get('amount')
-
-        if not all([razorpay_payment_id, razorpay_order_id, razorpay_signature]):
-            release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-            return Response({'error': 'Missing required payment verification parameters.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # 1. 🚀 SEC-04 / FIN-03: Replay Attack Defense (Check prior to external calls)
-        if GiftCardTransaction.objects.filter(razorpay_payment_id=razorpay_payment_id).exists():
-            release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-            return Response({'error': 'Payment ID has already been redeemed.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
+        provider_id = request.data.get('razorpay_order_id')
+        payment_id = request.data.get('razorpay_payment_id')
+        signature = request.data.get('razorpay_signature')
+        if any(not isinstance(value, str) or not 1 <= len(value) <= limit
+               for value, limit in ((provider_id, 100), (payment_id, 100), (signature, 256))):
+            return Response({'error': 'Invalid payment proof.'}, status=400)
+        # Authorize intent before claims, replay, serialization or provider I/O.
+        intent = PurchaseIntent.objects.filter(purchaser=request.user, purpose='gift_card', provider_order_id=provider_id).first()
+        if not intent or intent.state not in ('pending', 'settled'):
+            return Response({'error': 'Payment does not match this purchase.'}, status=400)
         try:
-            # 2. Cryptographic signature check
-            client.utility.verify_payment_signature({
-                'razorpay_order_id': razorpay_order_id,
-                'razorpay_payment_id': razorpay_payment_id,
-                'razorpay_signature': razorpay_signature
-            })
-
-            # 3. 🚀 FIN-02: Authoritative Gateway Verification (Never trust client-supplied amounts)
-            payment_details = client.payment.fetch(razorpay_payment_id)
-            if payment_details.get('status') not in ('captured', 'authorized'):
-                release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-                return Response({'error': 'Payment has not been captured.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            authoritative_amount = Decimal(str(payment_details.get('amount', 0))) / Decimal('100.00')
-            if authoritative_amount <= 0:
-                release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-                return Response({'error': 'Invalid payment amount.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            if client_amount is not None:
-                try:
-                    if Decimal(str(client_amount)) != authoritative_amount:
-                        release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-                        return Response({'error': 'Amount mismatch between gateway and client.'}, status=status.HTTP_400_BAD_REQUEST)
-                except Exception:
-                    release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-                    return Response({'error': 'Invalid client amount format.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            # 4. Atomic Database Reservation (Fast, isolated from network I/O)
-            with transaction.atomic():
-                if GiftCardTransaction.objects.filter(razorpay_payment_id=razorpay_payment_id).exists():
-                    release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-                    return Response({'error': 'Payment ID has already been redeemed.'}, status=status.HTTP_400_BAD_REQUEST)
-
-                gc = GiftCard.objects.create(
-                    owner=None,
-                    initial_balance=authoritative_amount,
-                    current_balance=authoritative_amount
-                )
-
-                GiftCardTransaction.objects.create(
-                    gift_card=gc,
-                    transaction_type='ISSUE',
-                    amount=authoritative_amount,
-                    user=request.user,
-                    razorpay_payment_id=razorpay_payment_id
-                )
-
-            # 5. 🚀 ARCH-03: Cloudinary upload strictly OUTSIDE the database transaction
-            try:
-                qr = qrcode.QRCode(version=1, box_size=10, border=5)
-                qr.add_data(str(gc.id))
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-
-                img_io = io.BytesIO()
-                img.save(img_io, format='PNG')
-                img_io.seek(0)
-
-                upload_res = cloudinary.uploader.upload(img_io, folder="gift_cards")
-                gc.qr_code_url = upload_res.get('secure_url')
-                gc.save(update_fields=['qr_code_url'])
-            except Exception as upload_err:
-                logger.error(f"[CLOUDINARY ERROR] QR upload failed for gc={gc.id}: {upload_err}")
-
-            resp_data = {
-                'message': 'Gift card purchased successfully',
-                'gift_card_id': gc.id,
-                'qr_url': gc.qr_code_url
-            }
-            store_idempotency_result(request.user.id, "giftcard_verify", idem_key, resp_data, status.HTTP_201_CREATED)
-            return Response(resp_data, status=status.HTTP_201_CREATED)
-
-        except razorpay.errors.SignatureVerificationError:
-            release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-            return Response({'error': 'Invalid payment signature'}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            release_idempotency_lock(request.user.id, "giftcard_verify", idem_key)
-            logger.error(f"[GIFTCARD ERROR] Verification error: {e}")
-            return Response({'error': 'Payment verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
+            if request.data.get('amount') is not None and Decimal(str(request.data['amount'])) * 100 != intent.expected_amount:
+                raise ModelValidationError('Amount does not match purchase.')
+            claim = ProviderPaymentClaim.objects.filter(payment_id=payment_id).first()
+            if claim and (claim.intent_id != intent.pk or claim.state != 'captured'):
+                raise ModelValidationError('Payment is unavailable for this purchase.')
+            if intent.state == 'settled':
+                if not claim or not intent.gift_card_id:
+                    raise ModelValidationError('Payment does not match settled purchase.')
+                return Response(gift_response(intent.gift_card), status=201)
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+            client.utility.verify_payment_signature({'razorpay_order_id': intent.provider_order_id,
+                'razorpay_payment_id': payment_id, 'razorpay_signature': signature})
+            entity = client.payment.fetch(payment_id, timeout=5)
+            if entity.get('id') != payment_id:
+                raise ModelValidationError('Provider payment does not match proof.')
+            card, _ = settle_gift_capture(intent.pk, entity)
+            return Response(gift_response(card), status=201)
+        except (ModelValidationError, razorpay.errors.SignatureVerificationError, ArithmeticError, ValueError):
+            return Response({'error': 'Payment does not match this purchase.'}, status=400)
+        except Exception:
+            return Response({'error': 'Payment outcome is unknown. Retry this same purchase.'}, status=503)
 
 class GiftCardCheckView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1844,7 +1743,7 @@ class GiftCardCheckView(APIView):
             if gc.owner is not None and gc.owner != request.user:
                 return Response({"error": "Unauthorized or invalid gift card."}, status=status.HTTP_403_FORBIDDEN)
             return Response({'balance': gc.current_balance}, status=status.HTTP_200_OK)
-        except GiftCard.DoesNotExist:
+        except (GiftCard.DoesNotExist, ModelValidationError, ValueError):
             return Response({'error': 'Invalid or inactive gift card'}, status=status.HTTP_400_BAD_REQUEST)
 
 class GiftCardListView(APIView):
@@ -1856,10 +1755,20 @@ class GiftCardListView(APIView):
 class GiftCardRedeemView(APIView):
     permission_classes = [IsAuthenticated]
     def post(self, request):
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
         gift_card_id = request.data.get('gift_card_id')
         try:
             with transaction.atomic():
+                intent = PurchaseIntent.objects.select_for_update().filter(gift_card_id=gift_card_id,
+                    purpose='gift_card', state='settled', claim__state='captured').first()
+                if not intent:
+                    return Response({'error': 'Gift card requires purchase reconciliation.'}, status=400)
                 gc = GiftCard.objects.select_for_update().get(Q(owner=None) | Q(owner=request.user), id=gift_card_id, is_active=True)
+                if gc.expires_at and gc.expires_at <= timezone.now():
+                    return Response({'error': 'Gift card has expired.'}, status=400)
+                if gc.current_balance * 100 != intent.expected_amount:
+                    return Response({'error': 'Gift card balance requires reconciliation.'}, status=400)
                 user = User.objects.select_for_update().get(id=request.user.id)
                 if gc.current_balance > 0:
                     amount_to_add = gc.current_balance
@@ -1889,5 +1798,5 @@ class GiftCardRedeemView(APIView):
                     }, status=status.HTTP_200_OK)
                 else:
                     return Response({'error': 'Gift card has zero balance.'}, status=status.HTTP_400_BAD_REQUEST)
-        except GiftCard.DoesNotExist:
+        except (GiftCard.DoesNotExist, ModelValidationError, ValueError):
             return Response({'error': 'Invalid or inactive gift card.'}, status=status.HTTP_400_BAD_REQUEST)

@@ -1,3 +1,4 @@
+from .purchase_test_utils import intent_for_order, intent_for_gift
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -201,6 +202,7 @@ class OrderFulfillmentTests(APITestCase):
 
     def test_cancelled_orders_retain_their_last_pre_fulfillment_contact(self):
         order = Order.objects.create(user=self.buyer, total_price=50, status='pending_payment')
+        intent_for_order(order)
         url = f'/api/orders/{order.pk}/'
         self.client.force_authenticate(self.buyer)
         self.assertEqual(self.client.put(url, {'contact_phone': '5550100'}, format='json').status_code, 200)
@@ -282,6 +284,7 @@ class OrderFulfillmentTests(APITestCase):
     @patch('razorpay.Client')
     def test_signed_webhook_refunds_cancelled_capture_without_reopening(self, gateway):
         order = Order.objects.create(user=self.buyer, total_price=50, status='cancelled', gateway_order_id='bound')
+        intent_for_order(order)
         item = OrderItem.objects.create(order=order, product=self.product, vendor=self.seller, price=50, status='cancelled')
         payload = {'event': 'payment.captured', 'payload': {'payment': {'entity': {
             'id': 'late', 'order_id': 'bound', 'amount': 5000, 'currency': 'INR', 'status': 'captured',
@@ -308,7 +311,7 @@ class OrderFulfillmentTests(APITestCase):
         item = order.order_items.get()
         capture = {'id': 'refunded-first', 'order_id': 'bound', 'amount': 5000, 'currency': 'INR', 'status': 'captured'}
         gateway.return_value.payment.fetch.return_value = {**capture, 'amount_refunded': 5000}
-        refund = {'refund': {'entity': {'payment_id': 'refunded-first'}}}
+        refund = {'refund': {'entity': {'id': 'rfnd_first', 'payment_id': 'refunded-first', 'currency': 'INR', 'amount': 5000, 'status': 'processed'}}}
 
         for event, payload, expected in (
             ('refund.processed', refund, 200),
@@ -334,6 +337,7 @@ class FulfillmentLockTests(TransactionTestCase):
         item = OrderItem.objects.create(order=order, price=50)
         Payment.objects.create(order=order, transaction_id='capture', amount=50,
                                status='completed', verified_at=timezone.now())
+        intent_for_order(order, settled=True)
         order.status = 'paid'
         order.save(update_fields=['status'])
         barrier = Barrier(2, timeout=10)

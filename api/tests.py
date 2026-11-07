@@ -1,3 +1,4 @@
+from .purchase_test_utils import intent_for_order, intent_for_gift, refund_fixture
 # tests.py
 import json
 import secrets
@@ -252,6 +253,7 @@ class UserPrivilegeRegressionTests(APITestCase):
         self.assertTrue(all(field.read_only for field in UserSerializer().fields.values()))
 
         gift_card = GiftCard.objects.create(initial_balance='25.00', current_balance='25.00')
+        intent_for_gift(gift_card, self.customer)
         self.client.force_authenticate(user=self.customer)
         redeemed = self.client.post('/api/gift-cards/redeem/', {'gift_card_id': str(gift_card.pk)}, format='json')
         self.assertEqual(redeemed.status_code, status.HTTP_200_OK)
@@ -581,6 +583,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
             order=order, transaction_id=f'fixture-{order.pk}', amount=order.total_price,
             status='completed', verified_at=timezone.now(),
         )
+        intent_for_order(order, settled=True)
         order.status = 'paid'
         order.save(update_fields=['status'])
 
@@ -656,6 +659,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
         OrderItem.objects.create(order=order, price=1000)
         self._settle_fixture(order)
         fulfill_order(order.pk, 'shipped')
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         response = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -667,6 +671,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.product.stock = 3
         self.product.save()
 
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         self.client.post(f'/api/orders/{order.id}/cancel/')
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock, 5)
@@ -858,6 +863,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
         order = Order.objects.create(user=self.customer, status='pending', total_price=50.00)
         item = OrderItem.objects.create(order=order, product=self.product, quantity=1, price=50.00, vendor=self.seller)
 
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         response = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -904,6 +910,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
     def test_52_verify_razorpay_payment_success(self, MockRazorpayClient, MockEmail):
         CartItem.objects.create(cart=self.cart, product=self.product, quantity=1)
         order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
+        intent_for_order(order)
 
         OrderItem.objects.create(order=order, product=self.product, price=1000)
         mock_client = MockRazorpayClient.return_value
@@ -938,6 +945,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
     @patch('razorpay.Client')
     def test_53_verify_razorpay_payment_invalid_signature(self, MockRazorpayClient):
         order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
+        intent_for_order(order)
 
         mock_client = MockRazorpayClient.return_value
         mock_client.payment.fetch.return_value = {
@@ -963,6 +971,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
     @patch('razorpay.Client')
     def test_54_webhook_payment_captured_does_not_revive_cancelled_order(self, MockRazorpayClient):
         order = Order.objects.create(user=self.customer, total_price=1000, status='cancelled', gateway_order_id='fixture_late')
+        intent_for_order(order)
         OrderItem.objects.create(order=order, product=self.product, quantity=2, price=1000, status='cancelled')
 
         payload = {
@@ -983,6 +992,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
     @patch('razorpay.Client')
     def test_55_webhook_payment_failed_cancels_order(self, MockRazorpayClient):
         order = Order.objects.create(user=self.customer, total_price=1000, status='pending', gateway_order_id='fixture_failed')
+        intent_for_order(order)
         OrderItem.objects.create(order=order, product=self.product, quantity=1, price=1000, status='pending')
 
         payload = {
@@ -997,7 +1007,8 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         order.refresh_from_db()
-        self.assertEqual(order.status, "cancelled")
+        self.assertEqual(order.status, "pending")
+        self.assertFalse(order.payment.exists())
 
     # ==========================================
     # PHASE 14: HTTP-ONLY COOKIES & JWT SECURITY
@@ -1250,6 +1261,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
         self.customer.save()
 
         order = Order.objects.create(user=self.customer, total_price=1000, status='pending_payment', gateway_order_id='order_rzp123')
+        intent_for_order(order)
 
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_payment_signature.return_value = None
@@ -1272,7 +1284,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
 
         # Due to our atomic wallet reservation, this should fail and the wallet must be restored
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('order balance', response.data['message'])
+        self.assertIn('authorized purchase', response.data['message'])
         self.customer.refresh_from_db()
         self.assertEqual(self.customer.wallet_balance, Decimal('100.00'))  # reserve rolled back
 
@@ -1283,6 +1295,7 @@ class EazyShopTitaniumTestSuite(APITestCase):
         from decimal import Decimal
         from api.models import GiftCard
         gc = GiftCard.objects.create(initial_balance=Decimal('100.00'), current_balance=Decimal('100.00'), is_active=True, owner=None)
+        intent_for_gift(gc, self.customer)
 
         self.customer.wallet_balance = Decimal('0.00')
         self.customer.save()
@@ -1486,7 +1499,7 @@ class Phase19FinancialSecurityTests(APITestCase):
         initial_order_count = Order.objects.count()
         initial_stock = self.product.stock
         with patch('razorpay.Client') as m:
-            m.return_value.order.create.return_value = {'id': 'o_test_123', 'amount': 10000, 'currency': 'INR'}
+            m.return_value.order.create.return_value = {'id': 'o_test_123', 'amount': int(self.product.price * 100), 'currency': 'INR'}
             res1 = self.client.post(self.order_url, {
                 "idempotency_key": "idem-abc-123",
                 "shipping_address": "addr", "contact_phone": "111",
@@ -1544,6 +1557,7 @@ class Phase2HardeningTests(APITestCase):
             order.save(update_fields=['status'])
         Payment.objects.create(order=order, transaction_id='lifecycle-capture', amount=500,
                                status='completed', verified_at=timezone.now())
+        intent_for_order(order, settled=True)
         order.save(update_fields=['status'])
         fulfill_order(order.pk, 'shipped')
         order, _ = fulfill_order(order.pk, 'delivered')
@@ -1702,7 +1716,7 @@ class Phase2HardeningTests(APITestCase):
     @patch('cloudinary.uploader.upload')
     @patch('razorpay.Client')
     def test_fin02_fin03_gift_card_purchase_security(self, MockRazorpay, MockCloudinary):
-        """FIN-02, FIN-03, SEC-04, ARCH-03: Authoritative gateway amount, replay prevention, and Cloudinary isolation."""
+        """FIN-02, FIN-03, SEC-04, ARCH-03: Authoritative gateway amount, same-intent replay, and private QR delivery."""
         self.client.force_authenticate(user=self.customer)
         mock_client = MockRazorpay.return_value
         mock_client.utility.verify_payment_signature.return_value = None
@@ -1713,6 +1727,11 @@ class Phase2HardeningTests(APITestCase):
         }
         MockCloudinary.return_value = {'secure_url': 'https://res.cloudinary.com/test/image/upload/sample_qr.png'}
 
+        from .models import PurchaseIntent
+        for suffix in ('123', '456', '789'):
+            PurchaseIntent.objects.create(purpose='gift_card', purchaser=self.customer, expected_amount=50000,
+                provider_order_id=f'order_gc_{suffix}', state='pending')
+        mock_client.payment.fetch.return_value.update(order_id='order_gc_123', currency='INR')
         # 1. Successful purchase with authoritative amount
         res = self.client.post('/api/gift-cards/verify/', {
             'razorpay_payment_id': 'pay_gc_valid_123',
@@ -1725,22 +1744,25 @@ class Phase2HardeningTests(APITestCase):
         gc = GiftCard.objects.get(id=gc_id)
         self.assertEqual(gc.initial_balance, Decimal('500.00'))
         self.assertEqual(gc.current_balance, Decimal('500.00'))
-        self.assertEqual(gc.qr_code_url, 'https://res.cloudinary.com/test/image/upload/sample_qr.png')
+        self.assertFalse(gc.qr_code_url)
+        self.assertTrue(res.data['qr_url'].startswith('data:image/png;base64,'))
+        MockCloudinary.assert_not_called()
 
         # Verify transaction logged with razorpay_payment_id
         tx = GiftCardTransaction.objects.get(razorpay_payment_id='pay_gc_valid_123')
         self.assertEqual(tx.gift_card, gc)
         self.assertEqual(tx.amount, Decimal('500.00'))
 
-        # 2. Replay attack with same razorpay_payment_id -> 400 Bad Request
+        # 2. Authorized same-intent replay returns the same card without a second issuance
         res_replay = self.client.post('/api/gift-cards/verify/', {
             'razorpay_payment_id': 'pay_gc_valid_123',
             'razorpay_order_id': 'order_gc_123',
             'razorpay_signature': 'valid_sig_123',
             'amount': '500.00'
         }, format='json')
-        self.assertEqual(res_replay.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('already been redeemed', res_replay.data['error'])
+        self.assertEqual(res_replay.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_replay.data['gift_card_id'], gc_id)
+        self.assertEqual(GiftCard.objects.count(), 1)
 
         # 3. Client amount tampering (client claims ₹5000 on a ₹500 payment) -> 400 Bad Request
         mock_client.payment.fetch.return_value = {
@@ -1755,7 +1777,7 @@ class Phase2HardeningTests(APITestCase):
             'amount': '5000.00'  # Tampered
         }, format='json')
         self.assertEqual(res_tamper.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('mismatch', res_tamper.data['error'])
+        self.assertIn('does not match', res_tamper.data['error'])
 
         # 4. Uncaptured payment status -> 400 Bad Request
         mock_client.payment.fetch.return_value = {
@@ -1770,7 +1792,7 @@ class Phase2HardeningTests(APITestCase):
             'amount': '500.00'
         }, format='json')
         self.assertEqual(res_uncaptured.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('not been captured', res_uncaptured.data['error'])
+        self.assertIn('does not match', res_uncaptured.data['error'])
 
     @patch('api.serializers.send_welcome_email')
     def test_arch02_welcome_email_on_commit(self, MockWelcome):
@@ -1980,7 +2002,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
 
     @patch('razorpay.Client')
     def test_blocker3_webhook_pending_payment_failed_restores_stock_and_wallet(self, MockRazorpayClient):
-        """BLOCKER 3: payment.failed webhook for pending_payment cancels order and restores stock + wallet."""
+        """BLOCKER 3: A failed attempt preserves pending purchase reservations for a later capture."""
         mock_client = MockRazorpayClient.return_value
         mock_client.utility.verify_webhook_signature.return_value = None
         mock_client.order.create.return_value = {
@@ -2032,18 +2054,17 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         )
         self.assertEqual(res_webhook.status_code, status.HTTP_200_OK)
 
-        # 3. Verify order cancelled, stock restored, wallet restored
+        # 3. Failed attempts do not release reservations or close the purchase.
         order.refresh_from_db()
-        self.assertEqual(order.status, 'cancelled')
+        self.assertEqual(order.status, 'pending_payment')
         self.product.refresh_from_db()
-        self.assertEqual(self.product.stock, 10)
+        self.assertEqual(self.product.stock, 9)
         self.customer.refresh_from_db()
-        self.assertEqual(self.customer.wallet_balance, Decimal('30.00'))
+        self.assertEqual(self.customer.wallet_balance, Decimal('0.00'))
 
         # 4. Verify wallet audit transaction recorded
         refund_tx = WalletTransaction.objects.filter(reference_id=f"ORDER-{order.id}", transaction_type='REFUND_ORDER').first()
-        self.assertIsNotNone(refund_tx)
-        self.assertEqual(refund_tx.amount, Decimal('30.00'))
+        self.assertIsNone(refund_tx)
 
         # 5. Duplicate webhook delivery does NOT double-restore stock
         res_webhook2 = self.client.post(
@@ -2054,7 +2075,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         )
         self.assertEqual(res_webhook2.status_code, status.HTTP_200_OK)
         self.product.refresh_from_db()
-        self.assertEqual(self.product.stock, 10)  # Still exactly 10!
+        self.assertEqual(self.product.stock, 9)  # Still exactly 10!
 
     def test_blocker4_checkout_deterministic_locking_and_stock_validation(self):
         """BLOCKER 4: Checkout locks items in sorted order, validates stock & active status."""
@@ -2172,7 +2193,10 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         from django.core.cache import cache
         from api.utils.idempotency import _sanitize_and_hash_key
         in_flight_key = 'inflight-idem-test-999'
-        cache.set(f"idem_lock_create_razorpay_order_{self.customer.id}_{_sanitize_and_hash_key(in_flight_key)}", True, timeout=30)
+        in_flight_order = Order.objects.create(user=self.customer, total_price=50, status='pending_payment')
+        from .models import PurchaseIntent
+        PurchaseIntent.objects.create(order=in_flight_order, purchaser=self.customer, purpose='merchandise',
+            expected_amount=5000, idempotency_key=in_flight_key, state='creating')
         res_conflict = self.client.post(
             '/api/orders/create-razorpay-order/',
             {
@@ -2184,7 +2208,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             format='json'
         )
         self.assertEqual(res_conflict.status_code, status.HTTP_409_CONFLICT)
-        self.assertIn('in progress', res_conflict.data['error'])
+        self.assertIn('reconciliation', res_conflict.data['error'])
 
         # 4. verify-razorpay-payment idempotency replay
         with patch('razorpay.Client') as m_rzp:
@@ -2329,12 +2353,14 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         )
         initial_stock = self.product.stock
 
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
+        mock_client.payment.refund.return_value, mock_client.payment.fetch.return_value = refund_fixture(pay_gateway, order)
         res_cancel = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(res_cancel.status_code, status.HTTP_200_OK)
 
         mock_client.payment.refund.assert_called_once_with(
             'pay_gateway_refund_test',
-            {'amount': 10000, 'notes': {'order_id': str(order.id), 'reason': 'Order cancelled by customer'}}
+            {'amount': 10000, 'notes': {'order_id': str(order.id), 'reason': 'Order cancelled by customer'}}, timeout=5
         )
         pay_gateway.refresh_from_db()
         self.assertEqual(pay_gateway.status, 'refunded')
@@ -2348,6 +2374,7 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             user=self.customer, total_price=Decimal('150.00'), status='pending_payment',
             gateway_order_id='order_auth_fixture', shipping_address='Auth Street', contact_phone='9990001112'
         )
+        intent_for_order(order_auth)
         auth_payload = {
             "event": "payment.authorized",
             "payload": {
@@ -2369,15 +2396,14 @@ class PhaseAFinancialIntegrityTests(APITestCase):
         )
         self.assertEqual(res_auth.status_code, status.HTTP_200_OK)
         p_auth = Payment.objects.filter(transaction_id='pay_auth_test_999').first()
-        self.assertIsNotNone(p_auth)
-        self.assertEqual(p_auth.status, 'authorized')
-        self.assertEqual(p_auth.amount, Decimal('150.00'))
+        self.assertIsNone(p_auth)  # Authorization alone creates no settled financial record.
 
         # 3. Webhook: order.paid
         order_to_pay = Order.objects.create(
             user=self.customer, total_price=Decimal('200.00'), status='pending_payment',
             gateway_order_id='order_rzp_paid_123', shipping_address='Paid Street', contact_phone='9990001112'
         )
+        intent_for_order(order_to_pay)
         OrderItem.objects.create(
             order=order_to_pay, product=self.product, vendor=self.seller, quantity=1, price=Decimal('200.00')
         )
@@ -2418,6 +2444,8 @@ class PhaseAFinancialIntegrityTests(APITestCase):
             order=order_refund, payment_method='razorpay', transaction_id='pay_to_refund_hook',
             amount=Decimal('50.00'), status='completed'
         )
+        intent_for_order(order_refund, settled=True)
+        refund_evidence, mock_client.payment.fetch.return_value = refund_fixture(pay_completed, order_refund)
         stock_before_refund_hook = self.product.stock
 
         refund_payload = {
@@ -2432,6 +2460,8 @@ class PhaseAFinancialIntegrityTests(APITestCase):
                 }
             }
         }
+        refund_payload['payload']['refund']['entity'].update(currency='INR', status='processed')
+        refund_payload['payload']['refund']['entity']['amount'] = refund_evidence['amount']
         res_rfnd = self.client.post(
             '/api/webhooks/razorpay/',
             json.dumps(refund_payload),
@@ -3024,6 +3054,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
             total_price=Decimal('200.00'),
             status='cancelled', gateway_order_id='late-depleted'
         )
+        intent_for_order(cancelled_order)
         OrderItem.objects.create(
             order=cancelled_order,
             product=prod_scarce,
@@ -3063,7 +3094,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
         mock_client.payment.refund.assert_called_with('pay_revival_depleted_1', {
             'amount': 20000,
             'notes': {'order_id': str(cancelled_order.id), 'reason': 'Capture after order cancellation'}
-        })
+        }, timeout=5)
         payment_a = Payment.objects.get(transaction_id="pay_revival_depleted_1")
         self.assertEqual(payment_a.status, 'refund_pending')
 
@@ -3080,6 +3111,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
             total_price=Decimal('100.00'),
             status='cancelled', gateway_order_id='late-available'
         )
+        intent_for_order(cancelled_order_b)
         OrderItem.objects.create(
             order=cancelled_order_b,
             product=prod_available,
@@ -3151,6 +3183,7 @@ class PhaseABHardeningRefinementTests(APITestCase):
         )
 
         self.client.force_authenticate(user=self.user)
+        intent_for_order(order_fail, settled=order_fail.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         res_fail = self.client.post(f'/api/orders/{order_fail.id}/cancel/')
         self.assertEqual(res_fail.status_code, status.HTTP_200_OK)
 
@@ -3185,6 +3218,8 @@ class PhaseABHardeningRefinementTests(APITestCase):
             status='completed'
         )
 
+        intent_for_order(order_success, settled=order_success.payment.filter(status='completed').exclude(payment_method='wallet').exists())
+        mock_client.payment.refund.return_value, mock_client.payment.fetch.return_value = refund_fixture(payment_success, order_success)
         res_ok = self.client.post(f'/api/orders/{order_success.id}/cancel/')
         self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
 
@@ -3770,6 +3805,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
         )
 
         # 1. First cancellation succeeds
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         res1 = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(res1.status_code, status.HTTP_200_OK)
 
@@ -3780,6 +3816,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
         self.assertEqual(order.status, 'cancelled')
 
         # 2. Immediate second cancellation attempt (simulating concurrent or replay request)
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         res2 = self.client.post(f'/api/orders/{order.id}/cancel/')
         self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("cannot cancel", res2.data.get('error', '').lower())
@@ -3829,6 +3866,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
             total_price=Decimal('200.00'),
             status='pending_payment', gateway_order_id='bound-multi'
         )
+        intent_for_order(revival_order)
         OrderItem.objects.create(
             order=revival_order,
             product=prod_high,
@@ -3874,6 +3912,8 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
         prod_low.refresh_from_db()
         self.assertEqual(prod_low.stock, 8, "Low product must stay reserved")
 
+        _, mock_client.payment.fetch.return_value = refund_fixture(
+            Payment.objects.get(transaction_id='pay_revival_deterministic_1'), revival_order)
         # Now test refund.processed on this settled order
         refund_payload = {
             "event": "refund.processed",
@@ -3893,6 +3933,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
                 }
             }
         }
+        refund_payload['payload']['refund']['entity'].update(currency='INR', status='processed')
         res_rfnd = self.client.post(
             '/api/webhooks/razorpay/',
             json.dumps(refund_payload),
@@ -3943,6 +3984,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
 
         initial_stock = self.product.stock
         self.client.force_authenticate(user=self.user)
+        intent_for_order(order_a, settled=order_a.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         res_a = self.client.post(f'/api/orders/{order_a.id}/cancel/')
         self.assertEqual(res_a.status_code, status.HTTP_200_OK)
 
@@ -3980,6 +4022,8 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
             status='completed'
         )
 
+        intent_for_order(order_b, settled=order_b.payment.filter(status='completed').exclude(payment_method='wallet').exists())
+        mock_client.payment.refund.return_value, mock_client.payment.fetch.return_value = refund_fixture(pay_b, order_b)
         res_b = self.client.post(f'/api/orders/{order_b.id}/cancel/')
         self.assertEqual(res_b.status_code, status.HTTP_200_OK)
 
@@ -4174,6 +4218,7 @@ class PhaseABCHardeningRefinementsSuite(APITestCase):
 
         # Cancel order via viewset -> verify invoice cache is purged
         self.client.force_authenticate(user=self.user)
+        intent_for_order(order, settled=order.payment.filter(status='completed').exclude(payment_method='wallet').exists())
         res_cancel = self.client.post(f"/api/orders/{order.id}/cancel/")
         self.assertEqual(res_cancel.status_code, status.HTTP_200_OK)
         self.assertIsNone(cache.get(inv_cache_key), "Order cancellation must invalidate invoice cache")

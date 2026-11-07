@@ -72,6 +72,8 @@ class PaymentPrivacyTests(APITestCase):
         OrderItem.objects.create(order=order, product=product, price=50, quantity=1)
         entity = {'id': 'pay_owned', 'order_id': order.gateway_order_id, 'amount': 5000,
                   'currency': 'INR', 'status': 'captured', 'method': 'card'}
+        from .purchase_test_utils import intent_for_order
+        intent_for_order(order)
         payment, _ = record_gateway_capture(order, entity)
         return order, payment
 

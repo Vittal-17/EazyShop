@@ -1,10 +1,11 @@
 // src/pages/GiftCards.jsx
-import React, { useState, useContext } from 'react';
+import React, { useState, useContext, useEffect, useRef, useCallback } from 'react';
 import { AuthContext } from '../context/AuthContext';
 import styled from 'styled-components';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FaGift, FaCheckCircle, FaRupeeSign, FaCopy, FaShieldAlt, FaWallet } from 'react-icons/fa';
 import { toast } from 'react-hot-toast';
+import { purchaseKey, clearPurchaseKey } from '../utils/purchaseKey';
 import { loadRazorpay } from '../utils/loadRazorpay';
 import { formatINR } from '../utils/currency';
 import AppLayout from '../components/AppLayout';
@@ -19,12 +20,28 @@ const GiftCards = () => {
     const [isRedeeming, setIsRedeeming] = useState(false);
     const [giftCard, setGiftCard] = useState(null);
     const [redeemedBalance, setRedeemedBalance] = useState(null);
+    const [purchases, setPurchases] = useState([]);
+    const [recoveryError, setRecoveryError] = useState('');
+    const submitting = useRef(false);
+    const recoverPurchases = useCallback(async () => {
+        try {
+            const response = await axiosInstance.get('/api/gift-cards/purchase/');
+            setPurchases(response.data);
+            setRecoveryError('');
+        } catch {
+            setRecoveryError('Could not retrieve gift purchases. Try checking again before paying.');
+        }
+    }, [axiosInstance]);
+    useEffect(() => { recoverPurchases(); }, [recoverPurchases]);
 
     const handlePurchase = async (e) => {
         e.preventDefault();
+        if (submitting.current) return;
+        submitting.current = true;
 
         const isRazorpayLoaded = await loadRazorpay();
         if (!isRazorpayLoaded) {
+            submitting.current = false;
             alert('Razorpay SDK failed to load. Disable adblockers for localhost.');
             return;
         }
@@ -32,10 +49,20 @@ const GiftCards = () => {
         setLoading(true);
 
         try {
-            const res = await axiosInstance.post('/api/gift-cards/purchase/', { amount });
+            const requestKey = purchaseKey('gift_card', user.id);
+            const res = await axiosInstance.post('/api/gift-cards/purchase/', { amount, idempotency_key: requestKey });
+            if (res.data.payment_complete) {
+                setGiftCard(res.data);
+                setAmount(res.data.amount);
+                clearPurchaseKey('gift_card', user.id, requestKey);
+                submitting.current = false;
+                recoverPurchases();
+                return;
+            }
 
             const { order_id, amount: rzpAmount, key } = res.data;
 
+            let capturePending = false;
             const options = {
                 key: key,
                 amount: rzpAmount * 100,
@@ -44,6 +71,7 @@ const GiftCards = () => {
                 description: `Digital Gift Card - ${formatINR(rzpAmount)}`,
                 order_id: order_id,
                 handler: async function (response) {
+                    capturePending = true;
                     setIsVerifying(true);
                     try {
                         const verifyRes = await axiosInstance.post('/api/gift-cards/verify/', {
@@ -53,25 +81,38 @@ const GiftCards = () => {
                             amount: rzpAmount
                         });
                         setGiftCard(verifyRes.data);
+                        clearPurchaseKey('gift_card', user.id);
+                        recoverPurchases();
                     } catch (err) {
-                        alert('Payment verification failed. Please contact support.');
+                        alert('Payment is not yet confirmed. Check previous purchases before paying again; contact support if it remains unresolved.');
                     } finally {
                         setIsVerifying(false);
+                        submitting.current = false;
                     }
                 },
+                modal: { ondismiss: () => { submitting.current = false; setLoading(false); } },
                 theme: { color: "#0B8457" }
             };
 
             if (!key) {
                 alert('Missing Razorpay Key. Please check backend configuration.');
                 setLoading(false);
+                submitting.current = false;
                 return;
             }
             const rzp = new window.Razorpay(options);
+            rzp.on('payment.failed', () => {
+                if (capturePending) return;
+                submitting.current = false;
+                setLoading(false);
+                toast.error('Payment attempt failed. Retry to resume the same gift purchase.');
+            });
             rzp.open();
         } catch (err) {
             console.error(err);
-            alert('Failed to initialize payment. Please try again.');
+            submitting.current = false;
+            alert(err.response?.data?.error || 'Payment initialization is uncertain. Check previous purchases before trying again.');
+            recoverPurchases();
         } finally {
             setLoading(false);
         }
@@ -188,6 +229,22 @@ const GiftCards = () => {
                     <p>The perfect gift, delivered instantly. Redeemable across our entire store.</p>
                 </Header>
 
+                <section aria-label="Previous gift purchases">
+                    <button type="button" onClick={recoverPurchases}>Check previous purchases</button>
+                    {recoveryError && <p role="alert">{recoveryError}</p>}
+                    {purchases.map(purchase => (
+                        <p key={purchase.intent_id}>
+                            {purchase.active && purchase.gift_card_id ? (
+                                <button type="button" onClick={() => {
+                                    setGiftCard(purchase); setAmount(purchase.amount);
+                                    clearPurchaseKey('gift_card', user.id, purchase.idempotency_key || null);
+                                }}>View purchased gift card ({formatINR(purchase.amount)})</button>
+                            ) : !['settled', 'refunded'].includes(purchase.state) ? (
+                                <span>Purchase {purchase.intent_id}: {purchase.state}. Check again or contact support before paying again.</span>
+                            ) : null}
+                        </p>
+                    ))}
+                </section>
                 <AnimatePresence mode="wait">
                     {giftCard ? (
                         <SuccessState

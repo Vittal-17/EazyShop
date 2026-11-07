@@ -1,8 +1,9 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import Checkout from './Checkout';
 import AuthContext from '../context/AuthContext';
+import { toast } from 'react-hot-toast';
 
 jest.mock('react-hot-toast', () => {
   const t = {
@@ -38,8 +39,10 @@ const renderCheckout = () => {
 describe('Checkout Component', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    sessionStorage.clear();
     window.Razorpay = jest.fn().mockImplementation(() => ({
       open: jest.fn(),
+      on: jest.fn(),
     }));
 
     mockAxiosInstance.get.mockImplementation((url) => {
@@ -110,4 +113,67 @@ describe('Checkout Component', () => {
     const callPayload = mockAxiosInstance.post.mock.calls[0][1];
     expect(callPayload.order_items[0]).not.toHaveProperty('price');
   });
+  it('failed attempt can retry the same key and provider order without cancellation', async () => {
+    const handlers = {};
+    window.Razorpay.mockImplementation(() => ({ open: jest.fn(), on: (event, fn) => { handlers[event] = fn; } }));
+    mockAxiosInstance.post.mockResolvedValue({ data: {
+      order_id: 999, razorpay_order_id: 'order_retry', amount: 10000, currency: 'INR', key_id: 'fixture'
+    } });
+    renderCheckout();
+    await screen.findByText('Mouse');
+    fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
+    await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
+    const key = mockAxiosInstance.post.mock.calls[0][1].idempotency_key;
+    await act(async () => {
+      handlers['payment.failed']();
+      await window.Razorpay.mock.calls[0][0].modal.ondismiss();
+    });
+    expect(mockAxiosInstance.post.mock.calls.some(([url]) => url.endsWith('/cancel/'))).toBe(false);
+    expect(sessionStorage.getItem('eazyshop:purchase:merchandise:1')).toBe(key);
+    fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
+    await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(2));
+    expect(mockAxiosInstance.post.mock.calls[1][1].idempotency_key).toBe(key);
+    expect(window.Razorpay.mock.calls[1][0].order_id).toBe('order_retry');
+  });
+
+  it('unresolved capture followed by failure/dismissal never cancels or discards the key', async () => {
+    const handlers = {};
+    window.Razorpay.mockImplementation(() => ({ open: jest.fn(), on: (event, fn) => { handlers[event] = fn; } }));
+    mockAxiosInstance.post.mockImplementation(url => url.endsWith('create-razorpay-order/')
+      ? Promise.resolve({ data: { order_id: 999, razorpay_order_id: 'order_unknown', amount: 10000, currency: 'INR', key_id: 'fixture' } })
+      : Promise.reject(new Error('Unknown captured outcome')));
+    renderCheckout();
+    await screen.findByText('Mouse');
+    fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
+    await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
+    const key = mockAxiosInstance.post.mock.calls[0][1].idempotency_key;
+    const options = window.Razorpay.mock.calls[0][0];
+    await act(async () => {
+      await options.handler({ razorpay_payment_id: 'pay_unknown', razorpay_order_id: 'order_unknown', razorpay_signature: 'fixture' });
+      handlers['payment.failed']();
+      await options.modal.ondismiss();
+    });
+    expect(sessionStorage.getItem('eazyshop:purchase:merchandise:1')).toBe(key);
+    expect(mockAxiosInstance.post.mock.calls.some(([url]) => url.endsWith('/cancel/'))).toBe(false);
+  });
+
+  it('shows a request conflict and preserves the unresolved key without opening checkout', async () => {
+    const message = 'This purchase key belongs to different items. Restore the original request; do not replace this key.';
+    sessionStorage.setItem('eazyshop:purchase:merchandise:1', 'unresolved-order');
+    mockAxiosInstance.post.mockRejectedValue({ response: { status: 409, data: {
+      code: 'purchase_request_conflict', error: message
+    } } });
+    renderCheckout();
+    await screen.findByText('Mouse');
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
+      await waitFor(() => expect(mockAxiosInstance.post).toHaveBeenCalledTimes(attempt));
+      await waitFor(() => expect(screen.getByRole('button', { name: /Place Secure Order/i })).not.toBeDisabled());
+    }
+    expect(toast.error).toHaveBeenCalledWith(`❌ ${message}`);
+    expect(sessionStorage.getItem('eazyshop:purchase:merchandise:1')).toBe('unresolved-order');
+    expect(mockAxiosInstance.post.mock.calls.every(([, data]) => data.idempotency_key === 'unresolved-order')).toBe(true);
+    expect(window.Razorpay).not.toHaveBeenCalled();
+  });
+
 });

@@ -2,6 +2,7 @@ import uuid
 from decimal import Decimal
 
 from django.conf import settings
+from django.utils import timezone
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -157,6 +158,8 @@ class OrderQuerySet(models.QuerySet):
         )
         return self.alias(total_minor=Cast(Round(models.F('total_price') * 100), models.BigIntegerField())).filter(
             Exists(OrderItem.objects.filter(order_id=OuterRef('pk')).exclude(status='cancelled')),
+            Exists(PurchaseIntent.objects.filter(order_id=OuterRef('pk'), state='settled', purpose='merchandise')
+                .filter(models.Q(expected_amount=0) | models.Q(claim__state='captured'))),
             ~Exists(payments.filter(status__in=['refunded', 'refund_pending', 'refund_failed'])),
             total_price__gt=0,
             total_minor=Subquery(verified_total),
@@ -237,7 +240,10 @@ class Order(models.Model):
                 if self.status == 'delivered' and active_items.exclude(status='delivered').exists():
                     raise ValidationError("All active order items must be delivered first.")
             self.full_clean()
-            return super().save(*args, **kwargs)
+            result = super().save(*args, **kwargs)
+            if self.status == 'cancelled':
+                PurchaseIntent.objects.filter(order=self).exclude(state__in=['refunded', 'reconciliation']).update(state='cancelled', updated_at=timezone.now())
+            return result
 
 
 class OrderItem(models.Model):
@@ -526,3 +532,88 @@ def invalidate_order_invoice_cache_signal(sender, instance, **kwargs):
     """
     for s in ['pending_payment', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded', 'failed', 'paid']:
         cache.delete(f"invoice_pdf_{instance.id}_{s}")
+
+class PurchaseIntent(models.Model):
+    """Server-created commercial terms. Legacy records deliberately have no intent."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    purpose = models.CharField(max_length=16, choices=[('merchandise', 'Merchandise'), ('gift_card', 'Gift card')])
+    purchaser = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    order = models.OneToOneField(Order, null=True, blank=True, on_delete=models.PROTECT, related_name='purchase_intent')
+    gift_card = models.OneToOneField('GiftCard', null=True, blank=True, on_delete=models.PROTECT, related_name='purchase_intent')
+    provider_order_id = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    currency = models.CharField(max_length=3, default='INR')
+    expected_amount = models.PositiveBigIntegerField()  # provider leg, minor units
+    wallet_amount = models.PositiveBigIntegerField(default=0)
+    wallet_debit = models.OneToOneField('WalletTransaction', null=True, blank=True, on_delete=models.PROTECT)
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
+    request_fingerprint = models.CharField(max_length=64, null=True, editable=False)
+    state = models.CharField(max_length=20, default='creating', choices=[(v, v) for v in (
+        'creating', 'pending', 'settled', 'cancelled', 'failed', 'refunded', 'reconciliation')])
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['purchaser', 'purpose', 'idempotency_key'], name='purchase_request_once'),
+            models.CheckConstraint(condition=models.Q(currency='INR'), name='intent_currency_inr'),
+            models.CheckConstraint(condition=models.Q(expected_amount__gt=0) | models.Q(wallet_amount__gt=0), name='intent_positive_total'),
+            models.CheckConstraint(condition=(models.Q(purpose='merchandise', order__isnull=False, gift_card__isnull=True) |
+                models.Q(purpose='gift_card', order__isnull=True, wallet_amount=0, expected_amount__gt=0)), name='intent_purpose_object'),
+            models.CheckConstraint(condition=(models.Q(wallet_amount=0, wallet_debit__isnull=True) |
+                models.Q(wallet_amount__gt=0, wallet_debit__isnull=False)), name='intent_wallet_evidence'),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            current = type(self).objects.get(pk=self.pk)
+            immutable = ('purpose', 'purchaser_id', 'order_id', 'currency', 'expected_amount',
+                         'wallet_amount', 'wallet_debit_id', 'idempotency_key', 'request_fingerprint')
+            if any(getattr(current, f) != getattr(self, f) for f in immutable):
+                raise ValidationError('Purchase terms are immutable.')
+            for field in ('provider_order_id', 'gift_card_id'):
+                if getattr(current, field) is not None and getattr(current, field) != getattr(self, field):
+                    raise ValidationError('Purchase binding is immutable.')
+            if current.state in ('cancelled', 'failed', 'refunded', 'reconciliation') and self.state in ('pending', 'settled'):
+                raise ValidationError('A closed purchase cannot be reactivated.')
+        return super().save(*args, **kwargs)
+
+
+class ProviderPaymentClaim(models.Model):
+    """One global provider payment namespace, including quarantined historical IDs."""
+    payment_id = models.CharField(max_length=100, primary_key=True)
+    intent = models.OneToOneField(PurchaseIntent, null=True, blank=True, on_delete=models.PROTECT, related_name='claim')
+    provider_order_id = models.CharField(max_length=100, blank=True)
+    amount = models.PositiveBigIntegerField(default=0)
+    currency = models.CharField(max_length=3, blank=True)
+    state = models.CharField(max_length=20, default='captured', choices=[(v, v) for v in (
+        'captured', 'refunded', 'quarantined', 'refund_pending')])
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ProviderEvent(models.Model):
+    """Signed-event inbox, without customer PII or bearer gift-card credentials."""
+    fingerprint = models.CharField(max_length=64, primary_key=True)
+    event = models.CharField(max_length=40)
+    payment_id = models.CharField(max_length=100, blank=True)
+    provider_order_id = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=20, default='received')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ProviderRefund(models.Model):
+    """Immutable processed refund evidence; amounts are provider-currency minor units."""
+    refund_id = models.CharField(max_length=100, primary_key=True)
+    claim = models.ForeignKey(ProviderPaymentClaim, on_delete=models.PROTECT, related_name='refunds')
+    amount = models.PositiveBigIntegerField()
+    currency = models.CharField(max_length=3)
+    provider_cumulative = models.PositiveBigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name='refund_amount_positive'),
+            models.CheckConstraint(condition=models.Q(provider_cumulative__gte=models.F('amount')), name='refund_cumulative_covers_event'),
+            models.CheckConstraint(condition=models.Q(currency='INR'), name='refund_currency_inr'),
+        ]
