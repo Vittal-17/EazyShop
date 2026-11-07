@@ -20,7 +20,7 @@ beforeEach(() => {
   localStorage.clear(); jest.clearAllMocks();
   api.get.mockResolvedValue({ data: fixture });
 });
-function mount() { render(<MemoryRouter><AuthProvider><Probe /></AuthProvider></MemoryRouter>); }
+function mount() { render(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AuthProvider><Probe /></AuthProvider></MemoryRouter>); }
 
 it('removes legacy JWT storage and confirms cookies before declaring login success', async () => {
   localStorage.setItem('access_token', 'obsolete'); localStorage.setItem('refresh_token', 'obsolete');
@@ -33,12 +33,18 @@ it('removes legacy JWT storage and confirms cookies before declaring login succe
 });
 
 it('does not claim login success if the browser rejects its session cookies', async () => {
-  api.post.mockResolvedValue({ status: 200, data: { user: fixture } });
-  api.get.mockRejectedValue({ response: { status: 401 } });
-  mount(); fireEvent.click(screen.getByText('login'));
-  await waitFor(() => expect(api.get).toHaveBeenCalled());
-  expect(screen.getByText('anonymous')).toBeInTheDocument();
-  expect(localStorage.getItem('user')).toBeNull();
+  const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    api.post.mockResolvedValue({ status: 200, data: { user: fixture } });
+    api.get.mockRejectedValue({ response: { status: 401 } });
+    mount(); fireEvent.click(screen.getByText('login'));
+    await waitFor(() => expect(api.get).toHaveBeenCalled());
+    expect(screen.getByText('anonymous')).toBeInTheDocument();
+    expect(localStorage.getItem('user')).toBeNull();
+    expect(consoleSpy).toHaveBeenCalledWith('Login failed:', undefined);
+  } finally {
+    consoleSpy.mockRestore();
+  }
 });
 
 it('retains user state and reports failure when server logout fails', async () => {

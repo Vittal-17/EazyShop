@@ -16,7 +16,7 @@ describe('NotFound Page Component', () => {
 
   it('renders 404 badge, heading, and description cleanly', () => {
     render(
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <NotFound />
       </BrowserRouter>
     );
@@ -28,7 +28,7 @@ describe('NotFound Page Component', () => {
 
   it('navigates to / when Return to Home button is clicked', () => {
     render(
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <NotFound />
       </BrowserRouter>
     );
@@ -42,7 +42,7 @@ describe('NotFound Page Component', () => {
 
   it('navigates to /products when Browse Products button is clicked', () => {
     render(
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <NotFound />
       </BrowserRouter>
     );

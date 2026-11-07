@@ -7,7 +7,7 @@ import AuthContext from '../context/AuthContext';
 const renderWithContext = (ui, { user = null, loading = false } = {}, initialEntry = '/protected') => {
   return render(
     <AuthContext.Provider value={{ user, loading }}>
-      <MemoryRouter initialEntries={[initialEntry]}>
+      <MemoryRouter initialEntries={[initialEntry]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="/login" element={<div>Login Page</div>} />
           <Route path="/" element={<div>Home Page</div>} />

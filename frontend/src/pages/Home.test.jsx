@@ -16,7 +16,7 @@ describe('Home Page Component', () => {
 
   it('renders hero title and optimized background image with high fetch priority', () => {
     render(
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Home />
       </BrowserRouter>
     );
@@ -32,7 +32,7 @@ describe('Home Page Component', () => {
 
   it('navigates to /products when Start Shopping CTA is clicked', () => {
     render(
-      <BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Home />
       </BrowserRouter>
     );

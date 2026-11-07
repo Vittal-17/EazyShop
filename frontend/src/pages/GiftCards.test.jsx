@@ -29,16 +29,22 @@ test('recovers a privately issued card after an interrupted response', async () 
 });
 
 test('unknown initialization keeps the same purchase key and reports uncertainty', async () => {
-  axiosInstance.post.mockRejectedValue({ response: { data: { error: 'Purchase requires reconciliation.' } } });
-  const { container } = renderPage();
-  await waitFor(() => expect(axiosInstance.get).toHaveBeenCalled());
-  fireEvent.submit(container.querySelector('form'));
-  await waitFor(() => expect(window.alert).toHaveBeenCalledWith('Purchase requires reconciliation.'));
-  const key = axiosInstance.post.mock.calls[0][1].idempotency_key;
-  fireEvent.submit(container.querySelector('form'));
-  await waitFor(() => expect(axiosInstance.post).toHaveBeenCalledTimes(2));
-  expect(axiosInstance.post.mock.calls[1][1].idempotency_key).toBe(key);
-  expect(window.Razorpay).not.toHaveBeenCalled();
+  const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    axiosInstance.post.mockRejectedValue({ response: { data: { error: 'Purchase requires reconciliation.' } } });
+    const { container } = renderPage();
+    await waitFor(() => expect(axiosInstance.get).toHaveBeenCalled());
+    fireEvent.submit(container.querySelector('form'));
+    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('Purchase requires reconciliation.'));
+    const key = axiosInstance.post.mock.calls[0][1].idempotency_key;
+    fireEvent.submit(container.querySelector('form'));
+    await waitFor(() => expect(axiosInstance.post).toHaveBeenCalledTimes(2));
+    expect(axiosInstance.post.mock.calls[1][1].idempotency_key).toBe(key);
+    expect(window.Razorpay).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  } finally {
+    consoleErrorSpy.mockRestore();
+  }
 });
 
 test('pending purchase recovery never displays an unissued credential', async () => {
@@ -86,23 +92,29 @@ test('unknown gift capture is not cleared by a reordered failure or dismissal', 
 });
 
 test('a changed denomination conflict preserves the original key and exposes no new checkout', async () => {
-  const message = 'This purchase key belongs to a different gift amount. Restore the original request; do not replace this key.';
-  axiosInstance.post.mockResolvedValueOnce({ data: { order_id: 'original_gift', amount: 500, key: 'fixture' } })
-    .mockRejectedValueOnce({ response: { status: 409, data: { code: 'purchase_request_conflict', error: message } } });
-  const { container } = renderPage();
-  await waitFor(() => expect(axiosInstance.get).toHaveBeenCalled());
-  fireEvent.click(screen.getByRole('button', { name: '₹500.00' }));
-  fireEvent.submit(container.querySelector('form'));
-  await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
-  const key = axiosInstance.post.mock.calls[0][1].idempotency_key;
-  act(() => window.Razorpay.mock.calls[0][0].modal.ondismiss());
-  fireEvent.click(screen.getByRole('button', { name: '₹1,000.00' }));
-  fireEvent.submit(container.querySelector('form'));
-  await waitFor(() => expect(window.alert).toHaveBeenCalledWith(message));
-  expect(axiosInstance.post.mock.calls[1][1]).toEqual({ amount: 1000, idempotency_key: key });
-  expect(sessionStorage.getItem('eazyshop:purchase:gift_card:1')).toBe(key);
-  expect(window.Razorpay).toHaveBeenCalledTimes(1);
-  expect(screen.queryByText('Payment Successful!')).not.toBeInTheDocument();
+  const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const message = 'This purchase key belongs to a different gift amount. Restore the original request; do not replace this key.';
+    axiosInstance.post.mockResolvedValueOnce({ data: { order_id: 'original_gift', amount: 500, key: 'fixture' } })
+      .mockRejectedValueOnce({ response: { status: 409, data: { code: 'purchase_request_conflict', error: message } } });
+    const { container } = renderPage();
+    await waitFor(() => expect(axiosInstance.get).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: '₹500.00' }));
+    fireEvent.submit(container.querySelector('form'));
+    await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
+    const key = axiosInstance.post.mock.calls[0][1].idempotency_key;
+    act(() => window.Razorpay.mock.calls[0][0].modal.ondismiss());
+    fireEvent.click(screen.getByRole('button', { name: '₹1,000.00' }));
+    fireEvent.submit(container.querySelector('form'));
+    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(message));
+    expect(axiosInstance.post.mock.calls[1][1]).toEqual({ amount: 1000, idempotency_key: key });
+    expect(sessionStorage.getItem('eazyshop:purchase:gift_card:1')).toBe(key);
+    expect(window.Razorpay).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('Payment Successful!')).not.toBeInTheDocument();
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  } finally {
+    consoleErrorSpy.mockRestore();
+  }
 });
 
 test('an identical settled initialization recovers the issued gift without opening the gateway', async () => {

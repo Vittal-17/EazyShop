@@ -17,7 +17,7 @@ const mockUser = { id: 1, username: 'buyer' };
 
 const renderCart = () => render(
   <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance, user: mockUser }}>
-    <BrowserRouter><Cart /></BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><Cart /></BrowserRouter>
   </AuthContext.Provider>
 );
 

@@ -19,7 +19,7 @@ const mockAxiosInstance = {
 const renderWithAuth = (ui, user = null) => {
   return render(
     <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance, user }}>
-      <BrowserRouter>{ui}</BrowserRouter>
+      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>{ui}</BrowserRouter>
     </AuthContext.Provider>
   );
 };

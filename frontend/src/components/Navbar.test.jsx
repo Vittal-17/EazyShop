@@ -13,7 +13,7 @@ describe('Navbar Component with Real-Time Cart Badge', () => {
   it('renders navigation links and no badge when cart is empty', async () => {
     render(
       <AuthContext.Provider value={{ user: null, logoutUser: jest.fn() }}>
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Navbar />
         </BrowserRouter>
       </AuthContext.Provider>
@@ -36,7 +36,7 @@ describe('Navbar Component with Real-Time Cart Badge', () => {
 
     render(
       <AuthContext.Provider value={{ user: null, logoutUser: jest.fn() }}>
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Navbar />
         </BrowserRouter>
       </AuthContext.Provider>
@@ -65,7 +65,7 @@ describe('Navbar Component with Real-Time Cart Badge', () => {
           axiosInstance: mockAxios,
         }}
       >
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Navbar />
         </BrowserRouter>
       </AuthContext.Provider>
@@ -80,7 +80,7 @@ describe('Navbar Component with Real-Time Cart Badge', () => {
   it('updates dynamically in real-time when cart-updated event is dispatched', async () => {
     render(
       <AuthContext.Provider value={{ user: null, logoutUser: jest.fn() }}>
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Navbar />
         </BrowserRouter>
       </AuthContext.Provider>
@@ -112,7 +112,7 @@ describe('Navbar Component with Real-Time Cart Badge', () => {
 
     render(
       <AuthContext.Provider value={{ user: null, logoutUser: jest.fn() }}>
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Navbar />
         </BrowserRouter>
       </AuthContext.Provider>

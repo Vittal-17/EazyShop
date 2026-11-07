@@ -19,7 +19,7 @@ const mockLoginUser = jest.fn();
 
 const renderRegister = () => render(
   <AuthContext.Provider value={{ loginUser: mockLoginUser }}>
-    <BrowserRouter><Register /></BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><Register /></BrowserRouter>
   </AuthContext.Provider>
 );
 

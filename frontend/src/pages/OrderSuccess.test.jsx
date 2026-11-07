@@ -11,7 +11,7 @@ const mockAxiosInstance = {
 const renderWithRouter = (initialEntries) => {
   return render(
     <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance }}>
-      <MemoryRouter initialEntries={initialEntries}>
+      <MemoryRouter initialEntries={initialEntries} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="/order-success/:orderId" element={<OrderSuccess />} />
         </Routes>

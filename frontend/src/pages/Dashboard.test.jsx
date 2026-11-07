@@ -18,7 +18,7 @@ const mockUser = { id: 1, username: 'testuser', email: 'test@test.com' };
 
 const renderDashboard = () => render(
   <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance, user: mockUser }}>
-    <BrowserRouter><Dashboard /></BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><Dashboard /></BrowserRouter>
   </AuthContext.Provider>
 );
 

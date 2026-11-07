@@ -17,7 +17,7 @@ const mockLoginUser = jest.fn();
 const renderLogin = () => {
   return render(
     <AuthContext.Provider value={{ loginUser: mockLoginUser }}>
-      <MemoryRouter initialEntries={[{ pathname: '/login', state: { from: '/checkout' } }]}>
+      <MemoryRouter initialEntries={[{ pathname: '/login', state: { from: '/checkout' } }]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/checkout" element={<div>Fake Checkout Page</div>} />

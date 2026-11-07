@@ -29,7 +29,7 @@ const mockUser = { id: 1, username: 'buyer', email: 'buyer@test.com' };
 const renderCheckout = () => {
   return render(
     <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance, user: mockUser }}>
-      <MemoryRouter>
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Checkout />
       </MemoryRouter>
     </AuthContext.Provider>
@@ -137,24 +137,30 @@ describe('Checkout Component', () => {
   });
 
   it('unresolved capture followed by failure/dismissal never cancels or discards the key', async () => {
-    const handlers = {};
-    window.Razorpay.mockImplementation(() => ({ open: jest.fn(), on: (event, fn) => { handlers[event] = fn; } }));
-    mockAxiosInstance.post.mockImplementation(url => url.endsWith('create-razorpay-order/')
-      ? Promise.resolve({ data: { order_id: 999, razorpay_order_id: 'order_unknown', amount: 10000, currency: 'INR', key_id: 'fixture' } })
-      : Promise.reject(new Error('Unknown captured outcome')));
-    renderCheckout();
-    await screen.findByText('Mouse');
-    fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
-    await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
-    const key = mockAxiosInstance.post.mock.calls[0][1].idempotency_key;
-    const options = window.Razorpay.mock.calls[0][0];
-    await act(async () => {
-      await options.handler({ razorpay_payment_id: 'pay_unknown', razorpay_order_id: 'order_unknown', razorpay_signature: 'fixture' });
-      handlers['payment.failed']();
-      await options.modal.ondismiss();
-    });
-    expect(sessionStorage.getItem('eazyshop:purchase:merchandise:1')).toBe(key);
-    expect(mockAxiosInstance.post.mock.calls.some(([url]) => url.endsWith('/cancel/'))).toBe(false);
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const handlers = {};
+      window.Razorpay.mockImplementation(() => ({ open: jest.fn(), on: (event, fn) => { handlers[event] = fn; } }));
+      mockAxiosInstance.post.mockImplementation(url => url.endsWith('create-razorpay-order/')
+        ? Promise.resolve({ data: { order_id: 999, razorpay_order_id: 'order_unknown', amount: 10000, currency: 'INR', key_id: 'fixture' } })
+        : Promise.reject(new Error('Unknown captured outcome')));
+      renderCheckout();
+      await screen.findByText('Mouse');
+      fireEvent.click(screen.getByRole('button', { name: /Place Secure Order/i }));
+      await waitFor(() => expect(window.Razorpay).toHaveBeenCalledTimes(1));
+      const key = mockAxiosInstance.post.mock.calls[0][1].idempotency_key;
+      const options = window.Razorpay.mock.calls[0][0];
+      await act(async () => {
+        await options.handler({ razorpay_payment_id: 'pay_unknown', razorpay_order_id: 'order_unknown', razorpay_signature: 'fixture' });
+        handlers['payment.failed']();
+        await options.modal.ondismiss();
+      });
+      expect(sessionStorage.getItem('eazyshop:purchase:merchandise:1')).toBe(key);
+      expect(mockAxiosInstance.post.mock.calls.some(([url]) => url.endsWith('/cancel/'))).toBe(false);
+      expect(consoleErrorSpy).toHaveBeenCalledWith('Verification error:', expect.any(Error));
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
   });
 
   it('shows a request conflict and preserves the unresolved key without opening checkout', async () => {

@@ -376,7 +376,7 @@ const DesktopWishlist = styled.div`
   @media (min-width: 900px) { display: block; }
 `;
 
-const NavLink = styled(motion(Link))`
+const NavLink = styled(motion.create(Link))`
   text-decoration: none;
   font-size: 0.95rem;
   font-weight: 600;
