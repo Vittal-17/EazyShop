@@ -26,3 +26,10 @@ jest.mock('axios', () => {
     ...mockAxiosInstance
   };
 });
+// jsdom in react-scripts lacks Web Crypto; use Node's implementation in tests.
+Object.defineProperty(global, 'crypto', { value: require('crypto').webcrypto, configurable: true });
+
+// Mock missing browser APIs in Jest/jsdom environment; retain real browser behavior in production.
+if (typeof window !== 'undefined') {
+  window.scrollTo = jest.fn();
+}

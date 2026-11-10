@@ -1,5 +1,5 @@
 // src/pages/Checkout.jsx
-import { useState, useEffect, useContext } from 'react';
+import { useState, useEffect, useContext, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import styled from 'styled-components';
 import AuthContext from '../context/AuthContext';
@@ -10,7 +10,8 @@ import { SkeletonRow } from '../components/SkeletonLoader';
 import { PageHeader, GlowingPageContainer } from '../styles/SharedPageStyles';
 import AppLayout from '../components/AppLayout';
 import { formatINR } from '../utils/currency';
-import { loadRazorpay } from '../utils/loadRazorpay'; 
+import { purchaseKey, clearPurchaseKey } from '../utils/purchaseKey';
+import { loadRazorpay } from '../utils/loadRazorpay';
 
 const Checkout = () => {
   const { axiosInstance, user } = useContext(AuthContext);
@@ -22,6 +23,7 @@ const Checkout = () => {
   const [contactPhone, setContactPhone] = useState('');
 
   const [loading, setLoading] = useState(false);
+  const isSubmittingRef = useRef(false);
   const [useWallet, setUseWallet] = useState(false);
   const [isFetching, setIsFetching] = useState(true);
 
@@ -62,40 +64,49 @@ const Checkout = () => {
 
 
   const handlePlaceOrder = async () => {
+    // 🚀 FE-P0-03: Atomic submission lock prevents double-click race conditions
+    if (isSubmittingRef.current || loading) return;
+
     if (!selectedAddressId) return toast.error('⚠️ Please select a delivery address!');
     if (!contactPhone.trim()) return toast.error('⚠️ A contact phone number is compulsory!');
     if (cartItems.length === 0) return toast.error('⚠️ Your cart is empty!');
 
-    const isRazorpayLoaded = await loadRazorpay();
-    if (!isRazorpayLoaded) {
-      toast.error('❌ Razorpay SDK failed to load. Disable adblockers for localhost.');
-      return;
-    }
-    
+    isSubmittingRef.current = true;
     setLoading(true);
+
     try {
+      const isRazorpayLoaded = await loadRazorpay();
+      if (!isRazorpayLoaded) {
+        toast.error('❌ Razorpay SDK failed to load. Disable adblockers for localhost.');
+        isSubmittingRef.current = false;
+        setLoading(false);
+        return;
+      }
+
       const selectedAddr = addresses.find(a => a.id === selectedAddressId);
       const addressSnapshot = `${selectedAddr.label}: ${selectedAddr.full_address}`;
       const payloadTotalPrice = cartTotal.toFixed(2);
       const payloadOrderItems = cartItems.map(item => ({
         product: item.product?.id || item.product,
         quantity: item.quantity,
-        price: Number(item.price),
       }));
-  
+
       const orderRes = await axiosInstance.post('/api/orders/create-razorpay-order/', {
+        idempotency_key: purchaseKey('merchandise', user.id),
         shipping_address: addressSnapshot,
         contact_phone: contactPhone,
         total_price: payloadTotalPrice,
         use_wallet: useWallet,
         order_items: payloadOrderItems,
       });
-  
+
       const orderData = orderRes.data;
 
       // 🚀 SCENARIO B: FULLY COVERED BY WALLET (BYPASS RAZORPAY)
       if (orderData.payment_complete) {
-        toast.success('🎉 Order fully paid using Wallet Balance!');
+        clearPurchaseKey('merchandise', user.id);
+        toast.success('Order payment confirmed.');
+        isSubmittingRef.current = false;
         setLoading(false);
         navigate(`/order-success/${orderData.order_id}`, {
           state: {
@@ -105,10 +116,12 @@ const Checkout = () => {
             userPhone: contactPhone
           }
         });
-        return; 
+        return;
       }
-  
+
       // 🚀 SCENARIO A: PARTIAL OR NO GIFT CARD (PROCEED TO RAZORPAY)
+      let attemptFailed = false;
+      let capturePending = false;
       const options = {
         key: orderData.key_id,
         amount: orderData.amount,
@@ -117,15 +130,16 @@ const Checkout = () => {
         description: "Secure Order Checkout",
         order_id: orderData.razorpay_order_id,
         handler: async function (response) {
+          capturePending = true;
           let timeoutHandle;
-          
+
           // 45-Second Safety Timeout Guard
           const safetyTimeout = new Promise((_, reject) => {
               timeoutHandle = setTimeout(() => {
                   reject(new Error("Gateway response timed out. Please check your order history."));
               }, 45000);
           });
-          
+
           try {
             const verifyCall = axiosInstance.post('/api/orders/verify-razorpay-payment/', {
               order_id: orderData.order_id,
@@ -133,12 +147,15 @@ const Checkout = () => {
               razorpay_payment_id: response.razorpay_payment_id,
               razorpay_signature: response.razorpay_signature,
             });
-  
+
             // Race the API call against the timeout
             const verifyRes = await Promise.race([verifyCall, safetyTimeout]);
             clearTimeout(timeoutHandle);
-  
+
             if (verifyRes.data.success) {
+              clearPurchaseKey('merchandise', user.id);
+              isSubmittingRef.current = false;
+              setLoading(false);
               toast.success('📦 Payment verified & Order placed successfully!');
               navigate(`/order-success/${verifyRes.data.order_id}`, {
                 state: {
@@ -150,12 +167,14 @@ const Checkout = () => {
               });
             } else {
               toast.error('❌ Payment verification failed');
+              isSubmittingRef.current = false;
               setLoading(false);
             }
           } catch (err) {
             clearTimeout(timeoutHandle);
             console.error('Verification error:', err);
             toast.error(err.message || '❌ Error verifying payment with server');
+            isSubmittingRef.current = false;
             setLoading(false);
           }
         },
@@ -169,30 +188,43 @@ const Checkout = () => {
         },
         modal: {
           ondismiss: async function() {
+            isSubmittingRef.current = false;
             setLoading(false);
+            if (capturePending || attemptFailed) {
+              toast.error(capturePending
+                ? 'Payment confirmation is unresolved. Check your order before paying again.'
+                : 'This attempt failed. Retry checkout to resume the same purchase.');
+              return;
+            }
             toast("Payment cancelled by user", { icon: '⚠️' });
-            
+
             try {
               await axiosInstance.post(`/api/orders/${orderData.order_id}/cancel/`);
+              clearPurchaseKey('merchandise', user.id);
             } catch (cancelErr) {
               console.error('Failed to cancel abandoned order:', cancelErr);
             }
           }
         }
       };
-  
+
       const rzp = new window.Razorpay(options);
-      
-      rzp.on('payment.failed', function (response) {
-        console.warn("Payment failed at gateway:", response.error.description);
+
+      rzp.on('payment.failed', function () {
+        if (capturePending) return; // A reordered failure must not erase an unresolved capture.
+        attemptFailed = true;
+        isSubmittingRef.current = false;
+        setLoading(false);
+        toast.error('Payment attempt failed. You can retry this same purchase.');
       });
-  
+
       rzp.open();
-  
+
     } catch (err) {
-      const serverMsg = err.response?.data?.message || err.response?.data?.detail || 'Failed to initialize payment';
-      toast.error(`❌ ${serverMsg}`);
+      isSubmittingRef.current = false;
       setLoading(false);
+      const serverMsg = err.response?.data?.error || err.response?.data?.message || err.response?.data?.detail || 'Failed to initialize payment';
+      toast.error(`❌ ${serverMsg}`);
     }
   };
 
@@ -293,10 +325,10 @@ const Checkout = () => {
                         <p style={{ margin: 0, fontSize: '0.9rem', color: '#64748B' }}>Use your unified wallet balance to pay for this order.</p>
                       </div>
                       <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', gap: '0.5rem' }}>
-                        <input 
-                          type="checkbox" 
-                          checked={useWallet} 
-                          onChange={(e) => setUseWallet(e.target.checked)} 
+                        <input
+                          type="checkbox"
+                          checked={useWallet}
+                          onChange={(e) => setUseWallet(e.target.checked)}
                           disabled={walletBalance <= 0}
                           style={{ width: '20px', height: '20px', accentColor: '#0B8457', cursor: walletBalance > 0 ? 'pointer' : 'not-allowed' }}
                         />
@@ -361,7 +393,7 @@ const Checkout = () => {
                     <span>Cart Total</span>
                     <span>{formatINR(cartTotal)}</span>
                   </SummaryRow>
-                  
+
                   {useWallet && appliedWalletAmount > 0 && (
                     <SummaryRow className="discount">
                       <span>Wallet Applied</span>
@@ -373,7 +405,7 @@ const Checkout = () => {
                     <span>Total to Pay</span>
                     <TotalAmount>{formatINR(finalTotal)}</TotalAmount>
                   </div>
-                  
+
                   <PlaceOrderButton onClick={handlePlaceOrder} disabled={loading || cartItems.length === 0 || addresses.length === 0 || !contactPhone} whileHover={{ scale: loading || cartItems.length === 0 || addresses.length === 0 || !contactPhone ? 1 : 1.02 }} whileTap={{ scale: loading || cartItems.length === 0 || addresses.length === 0 || !contactPhone ? 1 : 0.98 }}>
                     {loading ? 'Processing...' : (finalTotal > 0 ? 'Place Secure Order' : 'Complete Order with Wallet Balance')}
                   </PlaceOrderButton>
@@ -454,26 +486,26 @@ const ItemTotal = styled.div`
 const GiftCardWrapper = styled.div`
   .input-group {
     display: flex; gap: 1rem;
-    
+
     input {
       flex: 1; padding: 1rem 1.2rem; border-radius: 12px; border: 1px solid #E2E8F0;
       font-family: monospace; font-size: 1rem; outline: none; transition: all 0.2s; background: #ffffff; color: #0F172A;
     }
     input:focus { border-color: #0B8457; box-shadow: 0 0 0 3px rgba(11, 132, 87, 0.1); }
     input:disabled { background: #F8FAFC; color: #94A3B8; }
-    
+
     button { padding: 0 2rem; border-radius: 12px; font-weight: 700; font-size: 1rem; cursor: pointer; transition: all 0.2s; border: none; }
     .apply-btn { background: #0F172A; color: white; }
     .apply-btn:hover { background: #1E293B; box-shadow: 0 4px 12px rgba(15, 23, 42, 0.2); }
     .remove-btn { background: #FEF2F2; color: #EF4444; border: 1px solid #FECACA; }
     .remove-btn:hover { background: #FEE2E2; }
   }
-  
+
   .applied-success {
     display: flex; align-items: center; gap: 0.5rem; color: #059669; font-weight: 600; font-size: 0.9rem;
     margin-top: 1rem; padding: 0.8rem 1rem; background: #ECFDF5; border-radius: 12px; border: 1px solid #A7F3D0;
   }
-  
+
   @media (max-width: 600px) {
     .input-group { flex-direction: column; }
     .input-group button { padding: 1rem; }

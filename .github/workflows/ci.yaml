@@ -1,0 +1,198 @@
+name: CI
+
+'on':
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Static Analysis & Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.16.1
+
+      - name: Run Ruff F821 check (undefined names)
+        run: |
+          ruff check --select F821 api ecommerce_platform scripts
+
+
+      - name: Check PR whitespace and patch formatting
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch origin "${{ github.base_ref }}"
+            git -c core.whitespace=cr-at-eol diff --check "origin/${{ github.base_ref }}...HEAD"
+          else
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              git -c core.whitespace=cr-at-eol diff --check HEAD~1..HEAD
+            else
+              git -c core.whitespace=cr-at-eol diff --check
+            fi
+          fi
+
+
+  backend:
+    name: Backend Validation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: eazyshop_bootstrap
+          POSTGRES_PASSWORD: ci_bootstrap_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U eazyshop_bootstrap -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Initialize PostgreSQL databases and roles
+        env:
+          PGPASSWORD: ci_bootstrap_password
+          EAZYSHOP_DEV_PASSWORD: ci_dev_password
+          EAZYSHOP_TEST_PASSWORD: ci_test_password
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y postgresql-client
+          fi
+          psql -h 127.0.0.1 -p 5433 -U eazyshop_bootstrap -d postgres -v ON_ERROR_STOP=1 -f docker/postgres/init.sql
+
+      - name: Verify restricted roles and database ownership
+        env:
+          PGPASSWORD: ci_bootstrap_password
+        run: |
+          psql -h 127.0.0.1 -p 5433 -U eazyshop_bootstrap -d postgres -v ON_ERROR_STOP=1 << 'EOF'
+          DO $$
+          DECLARE
+            dev_rec RECORD;
+            test_rec RECORD;
+          BEGIN
+            SELECT rolsuper, rolcreatedb, rolcreaterole INTO dev_rec FROM pg_roles WHERE rolname = 'eazyshop_dev';
+            IF dev_rec IS NULL THEN
+              RAISE EXCEPTION 'Role eazyshop_dev not found';
+            END IF;
+            IF dev_rec.rolsuper OR dev_rec.rolcreatedb OR dev_rec.rolcreaterole THEN
+              RAISE EXCEPTION 'Role eazyshop_dev has excessive privileges';
+            END IF;
+
+            SELECT rolsuper, rolcreatedb, rolcreaterole INTO test_rec FROM pg_roles WHERE rolname = 'eazyshop_test';
+            IF test_rec IS NULL THEN
+              RAISE EXCEPTION 'Role eazyshop_test not found';
+            END IF;
+            IF test_rec.rolsuper OR test_rec.rolcreatedb OR test_rec.rolcreaterole THEN
+              RAISE EXCEPTION 'Role eazyshop_test has excessive privileges';
+            END IF;
+          END $$;
+
+          SELECT datname, pg_catalog.pg_get_userbyid(datdba) AS owner
+          FROM pg_database
+          WHERE datname IN ('eazyshop_dev', 'eazyshop_test');
+          EOF
+
+      - name: Provision synthetic environment profiles
+        run: |
+          cat << 'EOF' > .env.local
+          SECRET_KEY=ci-synthetic-django-secret-key-for-system-checks-only-not-for-prod
+          DEBUG=True
+          DATABASE_URL=postgresql://eazyshop_dev:ci_dev_password@127.0.0.1:5433/eazyshop_dev
+          BREVO_API_KEY=ci-placeholder
+          DEFAULT_FROM_EMAIL=ci@example.invalid
+          CLOUDINARY_URL=cloudinary://placeholder:placeholder@invalid
+          RAZORPAY_KEY_ID=ci-placeholder
+          RAZORPAY_KEY_SECRET=ci-placeholder
+          RAZORPAY_WEBHOOK_SECRET=ci-placeholder
+          REDIS_URL=
+          EOF
+          chmod 600 .env.local
+
+          cat << 'EOF' > .env.test
+          SECRET_KEY=ci-synthetic-django-secret-key-for-testing-only-not-for-prod
+          DEBUG=False
+          TEST_DATABASE_URL=postgresql://eazyshop_test:ci_test_password@127.0.0.1:5433/eazyshop_test
+          BREVO_API_KEY=ci-placeholder
+          DEFAULT_FROM_EMAIL=ci@example.invalid
+          CLOUDINARY_URL=cloudinary://placeholder:placeholder@invalid
+          RAZORPAY_KEY_ID=ci-placeholder
+          RAZORPAY_KEY_SECRET=ci-placeholder
+          RAZORPAY_WEBHOOK_SECRET=ci-placeholder
+          REDIS_URL=
+          EOF
+          chmod 600 .env.test
+
+      - name: Run Django system check
+        run: |
+          python manage.py check
+
+      - name: Run Django migration consistency check
+        run: |
+          python manage.py makemigrations --check --dry-run
+
+      - name: Run full discoverable Django test suite
+        run: |
+          python manage.py test api --noinput -v 2
+
+  frontend:
+    name: Frontend Validation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies with npm ci
+        run: |
+          npm ci
+
+      - name: Run noninteractive React tests
+        run: |
+          CI=true npm test -- --watchAll=false --runInBand
+
+      - name: Build frontend production bundle
+        run: |
+          npm run build

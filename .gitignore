@@ -47,6 +47,8 @@ yarn-error.log*
 
 .vscode/
 .idea/
+.agents/
+.opencode/
 
 # ==========================
 # OS Files
@@ -80,3 +82,11 @@ coverage/
 *Dockerfile
 *.yml
 *.conf
+EazyShop-latest.diff
+
+# Local PostgreSQL credentials, backups and approved infrastructure examples
+.local/
+!.env.local.example
+!.env.test.example
+!.env.postgres.example
+!compose.yaml

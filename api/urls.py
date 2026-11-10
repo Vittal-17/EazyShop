@@ -12,6 +12,7 @@ from .views import (
     CartItemViewSet,
     CartViewSet,
     CategoryViewSet,
+    CSRFTokenView,
     CookieTokenObtainPairView,
     CookieTokenRefreshView,
     CouponViewSet,
@@ -24,6 +25,7 @@ from .views import (
     ReviewViewSet,
     UserViewSet,
     VendorSalesViewSet,
+    WalletTransactionViewSet,
     WishlistViewSet,VerifyOTPView,RequestPasswordResetView,ConfirmPasswordResetView,DownloadInvoiceView,razorpay_webhook
 )
 
@@ -40,6 +42,7 @@ router.register(r'reviews', ReviewViewSet)
 router.register(r'wishlist', WishlistViewSet)
 router.register(r'coupons', CouponViewSet)
 router.register(r'payments', PaymentViewSet)
+router.register(r'wallet-transactions', WalletTransactionViewSet, basename='wallet-transactions')
 router.register(r'admin-logs', AdminLogViewSet)
 router.register(r'cart', CartViewSet, basename='cart')
 router.register(r'cart-items', CartItemViewSet, basename='cart-items')
@@ -59,6 +62,7 @@ urlpatterns = [
     path('', include(router.urls)),  # public API
     path('secure/api/', include(admin_router.urls)),  # protected admin-only API for React
     path('register/', RegisterView.as_view(), name='register'),
+    path('csrf/', CSRFTokenView.as_view(), name='csrf'),
     path('token/', CookieTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('token/refresh/', CookieTokenRefreshView.as_view(), name='token_refresh'),
     path('logout/', LogoutView.as_view(), name='logout'),

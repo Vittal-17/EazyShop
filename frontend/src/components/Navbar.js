@@ -2,9 +2,9 @@
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useContext, useState, useEffect } from 'react';
 import AuthContext from '../context/AuthContext';
-import { 
-  FaHome, FaShoppingCart, FaUser, 
-  FaSignInAlt, FaStore, FaClipboardList, 
+import {
+  FaHome, FaShoppingCart, FaUser,
+  FaSignInAlt, FaStore, FaClipboardList,
   FaUserShield, FaSignOutAlt, FaHeart,
   FaChevronDown, FaBars, FaTimes, FaEnvelope,
   FaTruck, FaGift
@@ -17,14 +17,51 @@ import FullScreenSpinner from './FullScreenSpinner';
 import brandLogoImg from '../assets/android-chrome-192x192.png';
 
 const Navbar = () => {
-  const { user, logoutUser } = useContext(AuthContext);
+  const { user, logoutUser, axiosInstance } = useContext(AuthContext);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [isScrolled, setIsScrolled] = useState(false);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  
+  const [cartCount, setCartCount] = useState(0);
+
   const navigate = useNavigate();
   const location = useLocation();
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const updateCartCount = async () => {
+      if (user && axiosInstance) {
+        try {
+          const res = await axiosInstance.get('/api/cart-items/');
+          const items = Array.isArray(res.data) ? res.data : (res.data?.results || []);
+          const total = items.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
+          if (isMounted) setCartCount(total);
+        } catch (err) {
+          // Keep existing or handle silently in header
+        }
+      } else {
+        try {
+          const tempCart = JSON.parse(localStorage.getItem('tempCart')) || [];
+          const total = tempCart.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
+          if (isMounted) setCartCount(total);
+        } catch (err) {
+          if (isMounted) setCartCount(0);
+        }
+      }
+    };
+
+    updateCartCount();
+
+    window.addEventListener('cart-updated', updateCartCount);
+    window.addEventListener('storage', updateCartCount);
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener('cart-updated', updateCartCount);
+      window.removeEventListener('storage', updateCartCount);
+    };
+  }, [user, axiosInstance, location.pathname]);
 
   useEffect(() => {
     const handleScroll = () => setIsScrolled(window.scrollY > 10);
@@ -44,15 +81,15 @@ const Navbar = () => {
   const toggleDropdown = () => setIsDropdownOpen(!isDropdownOpen);
   const toggleMobileMenu = () => setIsMobileMenuOpen(!isMobileMenuOpen);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setIsLoggingOut(true);
-    setTimeout(() => {
-      logoutUser();
-      setIsLoggingOut(false);
-      setTimeout(() => {
+    try {
+      if (await logoutUser()) {
         toast.success('👋 Logged out securely!', { duration: 3000, id: 'logout-success' });
-      }, 250);
-    }, 1000);
+      }
+    } finally {
+      setIsLoggingOut(false);
+    }
   };
 
   const renderNavLinks = () => (
@@ -60,16 +97,16 @@ const Navbar = () => {
       <CustomLink to="/" label="Home" icon={<FaHome />} currentPath={location.pathname} />
       <CustomLink to="/products" label="Store" icon={<FaStore />} currentPath={location.pathname} />
       <CustomLink to="/gift-cards" label="Gift Cards" icon={<FaGift />} currentPath={location.pathname} />
-      <CustomLink to="/cart" label="Cart" icon={<FaShoppingCart />} currentPath={location.pathname} />
-      
+      <CustomLink to="/cart" label="Cart" icon={<FaShoppingCart />} currentPath={location.pathname} badge={cartCount} />
+
       {user && (
         <CustomLink to="/dashboard" label="Dashboard" icon={<FaClipboardList />} currentPath={location.pathname} />
       )}
-      
+
       {user?.role === 'admin' && (
         <CustomLink to="/admin" label="Admin" icon={<FaUserShield />} currentPath={location.pathname} />
       )}
-      
+
       {user?.role === 'seller' && (
         <CustomLink to="/vendor" label="Vendor HQ" icon={<FaTruck />} currentPath={location.pathname} />
       )}
@@ -82,7 +119,7 @@ const Navbar = () => {
         {isLoggingOut && <FullScreenSpinner message="Signing out securely..." />}
       </AnimatePresence>
 
-      <NavContainer 
+      <NavContainer
         $isScrolled={isScrolled}
         initial={{ y: -100 }}
         animate={{ y: 0 }}
@@ -105,7 +142,7 @@ const Navbar = () => {
                 <DesktopWishlist>
                   <CustomLink to="/wishlist" label="Wishlist" icon={<FaHeart />} currentPath={location.pathname} />
                 </DesktopWishlist>
-                
+
                 <UserDropdownContainer>
                   <UserButton onClick={toggleDropdown} $isOpen={isDropdownOpen}>
                     {/* 🚀 CLOUDINARY PROFILE PICTURE INTEGRATION IN NAVBAR */}
@@ -119,12 +156,12 @@ const Navbar = () => {
                       )}
                     </NavAvatarWrapper>
 
-                    <UsernameText>{user.username}</UsernameText> 
+                    <UsernameText>{user.username}</UsernameText>
                     <motion.div animate={{ rotate: isDropdownOpen ? 180 : 0 }}>
                       <FaChevronDown size={12} />
                     </motion.div>
                   </UserButton>
-                  
+
                   <AnimatePresence>
                     {isDropdownOpen && (
                       <DropdownMenu
@@ -150,11 +187,11 @@ const Navbar = () => {
                             </UserInfoText>
                           </UserInfoHeader>
                         </UserInfo>
-                        
+
                         <DropdownButton onClick={() => navigate('/dashboard')}>
                           <FaUserShield /> Manage Profile
                         </DropdownButton>
-                        
+
                         <DropdownDivider />
                         <LogoutButton onClick={handleLogout}><FaSignOutAlt /> Logout</LogoutButton>
                       </DropdownMenu>
@@ -203,19 +240,50 @@ const Navbar = () => {
 // COMPONENT HELPERS & STYLED COMPONENTS
 // ==========================================
 
-const CustomLink = ({ to, label, icon, currentPath }) => {
+const CustomLink = ({ to, label, icon, currentPath, badge }) => {
   const isActive = currentPath === to;
   return (
-    <NavLink 
-      to={to} 
+    <NavLink
+      to={to}
       $isActive={isActive}
-      whileHover={{ scale: 1.05 }} 
+      whileHover={{ scale: 1.05 }}
       whileTap={{ scale: 0.95 }}
     >
-      {icon} <span className="label">{label}</span>
+      <IconWrapper>
+        {icon}
+        {badge > 0 && <CartBadge data-testid="cart-badge">{badge > 99 ? '99+' : badge}</CartBadge>}
+      </IconWrapper>
+      <span className="label">{label}</span>
     </NavLink>
   );
 };
+
+const IconWrapper = styled.span`
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+`;
+
+const CartBadge = styled.span`
+  position: absolute;
+  top: -8px;
+  right: -10px;
+  background: #ef4444;
+  color: #ffffff;
+  font-size: 0.65rem;
+  font-weight: 800;
+  min-width: 17px;
+  height: 17px;
+  border-radius: 9999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+  line-height: 1;
+`;
 
 // 🚀 UPGRADED FLOATING NAVBAR
 const NavContainer = styled(motion.div)`
@@ -233,7 +301,7 @@ const NavContainer = styled(motion.div)`
   display: flex;
   align-items: center;
   justify-content: space-between;
-  
+
   background: ${props => props.$isScrolled ? 'rgba(209, 250, 229, 0.95)' : 'rgba(220, 252, 231, 0.9)'};
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -258,7 +326,7 @@ const NavContent = styled.div`
   align-items: center;
   justify-content: space-between;
   padding: 0 2rem;
-  
+
   @media (max-width: 768px) { padding: 0 1rem; }
 `;
 
@@ -277,7 +345,7 @@ const BrandLogo = styled(Link)`
   align-items: center;
   gap: 0.6rem;
   letter-spacing: -0.5px;
-  
+
   .logo-img {
     height: 38px;
     width: auto;
@@ -308,7 +376,7 @@ const DesktopWishlist = styled.div`
   @media (min-width: 900px) { display: block; }
 `;
 
-const NavLink = styled(motion(Link))`
+const NavLink = styled(motion.create(Link))`
   text-decoration: none;
   font-size: 0.95rem;
   font-weight: 600;
@@ -320,7 +388,7 @@ const NavLink = styled(motion(Link))`
   color: ${props => props.$isActive ? '#ffffff' : '#4B5563'};
   background: ${props => props.$isActive ? '#0B8457' : 'transparent'};
   transition: all 0.2s ease-in-out;
-  
+
   svg {
     font-size: 1.1rem;
   }
@@ -382,13 +450,13 @@ const UserButton = styled(motion.button)`
 `;
 
 const UsernameText = styled.span`
-  max-width: 100px; 
-  white-space: nowrap; 
-  overflow: hidden; 
+  max-width: 100px;
+  white-space: nowrap;
+  overflow: hidden;
   text-overflow: ellipsis;
 
   @media (max-width: 480px) {
-    display: none; 
+    display: none;
   }
 
   @media (min-width: 481px) and (max-width: 768px) {
@@ -415,13 +483,13 @@ const DropdownMenu = styled(motion.div)`
   box-sizing: border-box;
 
   @media (max-width: 768px) {
-    position: fixed; 
-    top: 85px; 
+    position: fixed;
+    top: 85px;
     left: 0;
     right: 0;
-    margin: 0 auto; 
-    width: 92vw; 
-    max-width: 340px; 
+    margin: 0 auto;
+    width: 92vw;
+    max-width: 340px;
   }
 `;
 
@@ -482,7 +550,7 @@ const DropdownButton = styled(motion.button)`
   font-weight: 600;
   color: #374151;
   margin-top: 0.5rem;
-  
+
   &:hover { background: #e5e7eb; color: #111827; }
   svg { color: #0B8457; }
 `;
@@ -503,7 +571,7 @@ const LogoutButton = styled(motion.button)`
   gap: 0.6rem;
   cursor: pointer;
   transition: all 0.2s ease;
-  
+
   &:hover { background: #096b46; }
 `;
 

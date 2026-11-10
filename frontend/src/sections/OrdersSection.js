@@ -130,7 +130,7 @@ const OrdersSection = () => {
               <CloseButton onClick={() => setActiveOrder(null)}><FaTimes /></CloseButton>
               <ModalTitle>Update Order #{activeOrder.id}</ModalTitle>
               <StatusOptionList>
-                {['pending', 'shipped', 'delivered', 'cancelled'].map(statusType => {
+                {['shipped', 'delivered', 'cancelled'].map(statusType => {
                   const optConfig = getStatusConfig(statusType);
                   const isActive = activeOrder.status === statusType;
                   return (

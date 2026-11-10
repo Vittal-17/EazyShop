@@ -2,7 +2,7 @@ import { useState, useEffect, useContext } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import styled from 'styled-components';
 import AuthContext from '../context/AuthContext';
-import ModalPortal from './ModalPortal'; 
+import ModalPortal from './ModalPortal';
 
 const WAKEUP_MESSAGES = [
   "Spinning up eco-friendly standby container...",
@@ -27,11 +27,11 @@ const ServerWakeup = () => {
 
     const timeout = setTimeout(() => {
       if (isMounted) setIsWaking(true);
-    }, 1000);
+    }, 3500);
 
     const pingServer = async () => {
       try {
-        await axiosInstance.get('/api/categories/'); 
+        await axiosInstance.get('/api/categories/');
         if (isMounted) {
           setIsWaking(false);
           clearTimeout(timeout);
@@ -86,9 +86,9 @@ const ServerWakeup = () => {
     <AnimatePresence>
       {isWaking && (
         <ModalPortal>
-          <Overlay 
-            initial={{ opacity: 0 }} 
-            animate={{ opacity: 1 }} 
+          <Overlay
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.5 }}
           >
@@ -101,18 +101,18 @@ const ServerWakeup = () => {
               exit={{ scale: 0.85, opacity: 0, y: 30 }}
               transition={{ type: "spring", stiffness: 250, damping: 25 }}
             >
-              
+
               <SpinnerContainer>
-                <OuterRing 
-                  animate={{ rotate: 360 }} 
-                  transition={{ duration: 12, repeat: Infinity, ease: "linear" }} 
+                <OuterRing
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 12, repeat: Infinity, ease: "linear" }}
                 />
-                
-                <InnerRing 
-                  animate={{ rotate: -360 }} 
-                  transition={{ duration: 4, repeat: Infinity, ease: "linear" }} 
+
+                <InnerRing
+                  animate={{ rotate: -360 }}
+                  transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
                 />
-                
+
                 <CenterPulse
                   animate={{ scale: [1, 1.08, 1], boxShadow: ["0 0 15px rgba(16,185,129,0.3)", "0 0 35px rgba(16,185,129,0.7)", "0 0 15px rgba(16,185,129,0.3)"] }}
                   transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
@@ -127,10 +127,10 @@ const ServerWakeup = () => {
                 <SubText>
                   Our eco-friendly backend instance spins down automatically during periods of inactivity to conserve cloud resources. Please hang tight for a moment while we spin it back online for you!
                 </SubText>
-                
+
                 <MessageWrapper>
                   <AnimatePresence mode="wait">
-                    <AnimatedMessage 
+                    <AnimatedMessage
                       key={currentMessage}
                       initial={{ opacity: 0, y: 12 }}
                       animate={{ opacity: 1, y: 0 }}
@@ -141,6 +141,14 @@ const ServerWakeup = () => {
                     </AnimatedMessage>
                   </AnimatePresence>
                 </MessageWrapper>
+
+                <DismissButton
+                  onClick={() => setIsWaking(false)}
+                  whileHover={{ scale: 1.03 }}
+                  whileTap={{ scale: 0.97 }}
+                >
+                  Continue Browsing
+                </DismissButton>
               </TextContainer>
 
             </GlassModal>
@@ -157,7 +165,7 @@ const ServerWakeup = () => {
 
 const Overlay = styled(motion.div)`
   position: fixed; inset: 0;
-  background: rgba(15, 23, 42, 0.75); 
+  background: rgba(15, 23, 42, 0.75);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   display: flex; align-items: center; justify-content: center; z-index: 9999;
@@ -179,12 +187,12 @@ const GreenOrbBottom = styled.div`
 
 const GlassModal = styled(motion.div)`
   position: relative; z-index: 1;
-  background: linear-gradient(135deg, rgba(209, 250, 229, 0.92) 0%, rgba(236, 253, 245, 0.85) 100%); 
+  background: linear-gradient(135deg, rgba(209, 250, 229, 0.92) 0%, rgba(236, 253, 245, 0.85) 100%);
   backdrop-filter: blur(30px);
   -webkit-backdrop-filter: blur(30px);
-  padding: 3.5rem 2.5rem; 
+  padding: 3.5rem 2.5rem;
   border-radius: 36px;
-  max-width: 480px; width: 100%; 
+  max-width: 480px; width: 100%;
   box-shadow: 0 40px 80px -20px rgba(11, 132, 87, 0.45), inset 0 2px 8px rgba(255,255,255,0.9);
   border: 1.5px solid rgba(16, 185, 129, 0.2);
   display: flex;
@@ -254,13 +262,13 @@ const LogoImg = styled.img`
 
 const TextContainer = styled.div`
   width: 100%;
-  
-  h2 { 
-    color: #0F172A; 
-    font-size: 1.7rem; 
-    margin: 0 0 0.75rem 0; 
-    font-weight: 900; 
-    letter-spacing: -0.5px; 
+
+  h2 {
+    color: #0F172A;
+    font-size: 1.7rem;
+    margin: 0 0 0.75rem 0;
+    font-weight: 900;
+    letter-spacing: -0.5px;
   }
 `;
 
@@ -273,7 +281,7 @@ const SubText = styled.p`
 `;
 
 const MessageWrapper = styled.div`
-  height: 2.5rem; 
+  height: 2.5rem;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -285,15 +293,32 @@ const MessageWrapper = styled.div`
 `;
 
 const AnimatedMessage = styled(motion.p)`
-  color: #0B8457; 
-  font-size: 0.9rem; 
+  color: #0B8457;
+  font-size: 0.9rem;
   font-weight: 700;
-  line-height: 1.4; 
+  line-height: 1.4;
   margin: 0;
   width: 100%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+`;
+
+const DismissButton = styled(motion.button)`
+  margin-top: 1.25rem;
+  background: transparent;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  color: #0B8457;
+  padding: 0.6rem 1.4rem;
+  border-radius: 9999px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+
+  &:hover {
+    background: rgba(16, 185, 129, 0.1);
+  }
 `;
 
 export default ServerWakeup;

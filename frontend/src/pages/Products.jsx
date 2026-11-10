@@ -13,7 +13,7 @@ import { formatINR } from '../utils/currency';
 
 const Products = () => {
   const { axiosInstance, user } = useContext(AuthContext);
-  
+
   // Core Data States
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -29,7 +29,7 @@ const Products = () => {
   const [category, setCategory] = useState('');
   const [sort, setSort] = useState('');
 
-  // UI Slider State 
+  // UI Slider State
   const [highestPrice, setHighestPrice] = useState(1000);
   const [minPrice, setMinPrice] = useState(0);
   const [maxPrice, setMaxPrice] = useState(1000);
@@ -46,7 +46,7 @@ const Products = () => {
     const timer = setTimeout(() => {
       setDebouncedMin(minPrice);
       setDebouncedMax(maxPrice);
-      setCurrentPage(1); 
+      setCurrentPage(1);
     }, 500);
     return () => clearTimeout(timer);
   }, [minPrice, maxPrice]);
@@ -73,11 +73,11 @@ const Products = () => {
   };
 
   const clearFilters = () => {
-    setSearch(''); 
-    setCategory(''); 
-    setSort(''); 
-    setMinPrice(0); 
-    setMaxPrice(highestPrice); 
+    setSearch('');
+    setCategory('');
+    setSort('');
+    setMinPrice(0);
+    setMaxPrice(highestPrice);
     setInStockOnly(false);
     setCurrentPage(1);
   };
@@ -104,28 +104,13 @@ const Products = () => {
           setTotalPages(Math.ceil(res.data.count / 12) || 1);
         }
 
-        // Hydrate detailed data safely
-        const productsData = await Promise.all(validItems.map(async p => {
-          if (!p || !p.id) return null;
-          try {
-            const { data } = await axiosInstance.get(`/api/products/${p.id}/`);
-            return { 
-              ...p, 
-              price: Number(p.price || data.price || 0), 
-              image: data.image_url || data.image || p.image_url || p.image || null, 
-              stock: Number(data.stock !== undefined ? data.stock : (p.stock || 0))
-            };
-          } catch (e) {
-            return { 
-              ...p, 
-              price: Number(p.price || 0), 
-              image: p.image_url || p.image || null, 
-              stock: Number(p.stock || 0) 
-            };
-          }
+        // Efficient O(1) in-memory mapping from authoritative product list payload (Zero N+1 waterfalls)
+        const finalProducts = validItems.filter(p => p && p.id).map(p => ({
+          ...p,
+          price: Number(p.price || 0),
+          image: p.image_url || p.image || null,
+          stock: Number(p.stock !== undefined ? p.stock : 0)
         }));
-
-        const finalProducts = productsData.filter(Boolean);
 
         if (isInitialLoad && finalProducts.length > 0) {
           const calculatedMax = Math.ceil(Math.max(...finalProducts.map(p => Number(p.price || 0))));
@@ -154,7 +139,7 @@ const Products = () => {
     axiosInstance.get('/api/categories/')
       .then(res => setCategories(res.data.results || res.data))
       .catch(() => console.warn('Failed to load categories'));
-      
+
     // eslint-disable-next-line
   }, [axiosInstance, currentPage, search, category, sort, debouncedMin, debouncedMax, inStockOnly]);
 
@@ -167,6 +152,7 @@ const Products = () => {
     if (user) {
       try {
         await axiosInstance.post('/api/cart-items/', { product: product.id, quantity: qty });
+        window.dispatchEvent(new Event('cart-updated'));
         toast.success(t => (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <span>🛒 <b>{product.name}</b> added to cart!</span>
@@ -190,6 +176,7 @@ const Products = () => {
         tempCart.push({ id: `temp_${product.id}`, product: product.id, product_name: product.name, product_image: product.image, price: product.price, quantity: qty, product_stock: product.stock });
       }
       localStorage.setItem('tempCart', JSON.stringify(tempCart));
+      window.dispatchEvent(new Event('cart-updated'));
       toast.success(t => (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
           <span>🛒 <b>{product.name}</b> added to guest cart!</span>
@@ -572,17 +559,17 @@ const ToggleSwitch = styled.div`
 `;
 
 const ClearButton = styled(motion.button)`
-  display: flex; 
-  align-items: center; 
+  display: flex;
+  align-items: center;
   justify-content: center;
-  gap: 0.4rem; 
-  padding: 0.6rem 1.2rem; 
-  background: #FEF2F2; 
-  color: #DC2626; 
-  border: 1px solid #FCA5A5; 
-  border-radius: 50px; 
-  font-weight: 600; 
-  font-size: 0.9rem; 
+  gap: 0.4rem;
+  padding: 0.6rem 1.2rem;
+  background: #FEF2F2;
+  color: #DC2626;
+  border: 1px solid #FCA5A5;
+  border-radius: 50px;
+  font-weight: 600;
+  font-size: 0.9rem;
   cursor: pointer;
   visibility: ${props => props.$visible ? 'visible' : 'hidden'};
   opacity: ${props => props.$visible ? 1 : 0};
@@ -599,14 +586,14 @@ const ClearButton = styled(motion.button)`
 const ProductsContainer = styled.div`
   position: relative;
   z-index: 1;
-  max-width: 1500px; 
+  max-width: 1500px;
   margin: 0 auto;
   padding: 0 2.5rem;
   box-sizing: border-box;
 
   @media (max-width: 768px) {
     padding: 0 0.75rem;
-    margin-top: 1rem; 
+    margin-top: 1rem;
   }
 `;
 

@@ -1,26 +1,31 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, useLocation } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import './App.css';
-import Home from './pages/Home';
-import Products from './pages/Products';
-import ProductDetails from './pages/ProductDetails';
-import Cart from './pages/Cart';
-import Checkout from './pages/Checkout';
-import GiftCards from './pages/GiftCards';
-import Login from './pages/Login';
-import Register from './pages/Register';
-import Dashboard from './pages/Dashboard';
-import AdminPanel from './pages/AdminPanel';
 import ProtectedRoute from './components/ProtectedRoute';
 import Layout from './components/Layout';
 import ServerWakeup from './components/ServerWakeup';
 import Navbar from './components/Navbar';
-import Wishlist from './pages/Wishlist';
-import OrderSuccess from './pages/OrderSuccess';
 import AppToaster from './components/AppToaster';
-import VendorDashboard from './pages/VendorDashboard';
-import ForgotPassword from './pages/ForgotPassword'
+import ErrorBoundary from './components/ErrorBoundary';
+import FullScreenSpinner from './components/FullScreenSpinner';
+
+// Route Code Splitting via React.lazy
+const Home = lazy(() => import('./pages/Home'));
+const Products = lazy(() => import('./pages/Products'));
+const ProductDetails = lazy(() => import('./pages/ProductDetails'));
+const Cart = lazy(() => import('./pages/Cart'));
+const Checkout = lazy(() => import('./pages/Checkout'));
+const GiftCards = lazy(() => import('./pages/GiftCards'));
+const Login = lazy(() => import('./pages/Login'));
+const Register = lazy(() => import('./pages/Register'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const AdminPanel = lazy(() => import('./pages/AdminPanel'));
+const Wishlist = lazy(() => import('./pages/Wishlist'));
+const OrderSuccess = lazy(() => import('./pages/OrderSuccess'));
+const VendorDashboard = lazy(() => import('./pages/VendorDashboard'));
+const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
+const NotFound = lazy(() => import('./pages/NotFound'));
 
 // --- ScrollToTop Component ---
 function ScrollToTop() {
@@ -41,35 +46,39 @@ function AppContent() {
       <Navbar />
       <ServerWakeup />
 
-      {/* 🚀 Cleaned out AnimatePresence and AnimatedPage so nothing blocks your spinner! */}
-      <Routes>
-        <Route path="/" element={<Layout />} />
-        <Route index element={<Home />} />
-        <Route path="/products" element={<Products />} />
-        <Route path="/products/:id" element={<ProductDetails />} />
-        <Route path="/cart" element={<Cart />} />
-        <Route path="/gift-cards" element={<GiftCards />} />
-        <Route path="/checkout" element={<Checkout />} />
-        <Route path="/order-success/:orderId" element={<OrderSuccess />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
-        <Route path="/wishlist" element={<Wishlist />} />
-        <Route path="/forgot-password" element={<ForgotPassword />} />
-        <Route path="/vendor" element={ <ProtectedRoute><VendorDashboard /></ProtectedRoute> } />
-        <Route path="/dashboard" element={ <ProtectedRoute><Dashboard /></ProtectedRoute> } />
-        <Route path="/admin" element={ <ProtectedRoute adminOnly><AdminPanel /></ProtectedRoute> } />
-      </Routes>
+      <Suspense fallback={<FullScreenSpinner message="Loading..." />}>
+        <Routes>
+          <Route path="/" element={<Layout />} />
+          <Route index element={<Home />} />
+          <Route path="/products" element={<Products />} />
+          <Route path="/products/:id" element={<ProductDetails />} />
+          <Route path="/cart" element={<Cart />} />
+          <Route path="/gift-cards" element={<GiftCards />} />
+          <Route path="/checkout" element={<Checkout />} />
+          <Route path="/order-success/:orderId" element={<OrderSuccess />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/wishlist" element={<Wishlist />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/vendor" element={ <ProtectedRoute><VendorDashboard /></ProtectedRoute> } />
+          <Route path="/dashboard" element={ <ProtectedRoute><Dashboard /></ProtectedRoute> } />
+          <Route path="/admin" element={ <ProtectedRoute adminOnly><AdminPanel /></ProtectedRoute> } />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </Suspense>
     </>
   );
 }
 
 function App() {
   return (
-    <Router>
-      <AuthProvider>
-        <AppContent />
-      </AuthProvider>
-    </Router>
+    <ErrorBoundary>
+      <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <AuthProvider>
+          <AppContent />
+        </AuthProvider>
+      </Router>
+    </ErrorBoundary>
   );
 }
 

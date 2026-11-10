@@ -2,7 +2,7 @@
 import { useNavigate } from 'react-router-dom';
 import styled from 'styled-components';
 import { motion } from 'framer-motion';
-import homeBgImage from '../assets/home.jpg'; 
+import homeBgImage from '../assets/home.webp';
 
 const Home = () => {
   const navigate = useNavigate();
@@ -10,31 +10,31 @@ const Home = () => {
   return (
     <HeroContainer>
       <BackgroundWrapper>
-        <BackgroundImage src={homeBgImage} alt="EazyShop 3D eCommerce" />
+        <BackgroundImage src={homeBgImage} alt="EazyShop 3D eCommerce" fetchPriority="high" loading="eager" />
       </BackgroundWrapper>
-      
+
       <GlassCard
         initial={{ opacity: 0, y: 30 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.6, ease: "easeOut" }}
       >
-        <HeroTitle 
+        <HeroTitle
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.2, duration: 0.5, type: "spring", stiffness: 300, damping: 24 }}
         >
           Welcome to EazyShop
         </HeroTitle>
-        
-        <Subtitle 
+
+        <Subtitle
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.35, duration: 0.5, type: "spring", stiffness: 300, damping: 24 }}
         >
           Discover curated collections and experience effortless shopping with our seamless platform.
         </Subtitle>
-        
-        <CTAButton 
+
+        <CTAButton
           onClick={() => navigate('/products')}
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -54,7 +54,7 @@ const Home = () => {
 const HeroContainer = styled.div`
   position: relative;
   width: 100%;
-  min-height: 100vh; 
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -79,8 +79,8 @@ const BackgroundImage = styled.img`
   width: 100%;
   height: 100%;
   object-fit: cover;
-  opacity: 0.9; 
-  display: block; 
+  opacity: 0.9;
+  display: block;
 `;
 
 const GlassCard = styled(motion.div)`
@@ -114,13 +114,13 @@ const HeroTitle = styled(motion.h1)`
   /* 🚀 MOBILE FIX: Lowered the minimum font size from 3rem to 2.2rem so it scales down on small phones */
   font-size: clamp(2.2rem, 8vw, 4.5rem);
   font-weight: 900;
-  color: #0B8457; 
+  color: #0B8457;
   margin-bottom: 1.2rem;
   letter-spacing: -1px;
   position: relative;
   z-index: 2;
   word-wrap: break-word; /* Prevents long words from breaking the container */
-  
+
   @media (max-width: 768px) {
     margin-bottom: 0.8rem;
   }
@@ -144,7 +144,7 @@ const Subtitle = styled(motion.p)`
 `;
 
 const CTAButton = styled(motion.button)`
-  background: #0B8457; 
+  background: #0B8457;
   color: white;
   border: none;
   padding: 1rem 2.5rem;
@@ -160,12 +160,12 @@ const CTAButton = styled(motion.button)`
   position: relative;
   overflow: hidden;
   z-index: 2;
-  
+
   .icon {
     font-size: 1.2rem;
     z-index: 2;
   }
-  
+
   /* Liquid Shimmer Effect */
   &::after {
     content: '';
@@ -179,13 +179,13 @@ const CTAButton = styled(motion.button)`
     animation: shimmer 4s infinite;
     z-index: 1;
   }
-  
+
   @keyframes shimmer {
     0% { left: -150%; }
     20% { left: 200%; }
     100% { left: 200%; }
   }
-  
+
   &:hover {
     background: #096b46;
     box-shadow: 0 8px 20px rgba(11, 132, 87, 0.5);

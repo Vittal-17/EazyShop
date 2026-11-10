@@ -19,7 +19,7 @@ const renderWithRouter = (ui, user = null) => {
   return render(
     <AuthContext.Provider value={{ axiosInstance: mockAxiosInstance, user }}>
       {/* MemoryRouter allows us to fake the URL parameters */}
-      <MemoryRouter initialEntries={['/products/99']}>
+      <MemoryRouter initialEntries={['/products/99']} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="/products/:id" element={ui} />
         </Routes>

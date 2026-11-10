@@ -2,22 +2,22 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import random
-import threading
+import secrets
 import time
 from datetime import date
+from api.utils.async_tasks import run_async
 import razorpay
 from decimal import Decimal
 
-import qrcode
-import cloudinary.uploader
 import io
 import uuid
 
 from django.conf import settings
 from django.core.cache import cache
 from django.core.mail import send_mail
+from django.core.exceptions import ValidationError as ModelValidationError
 from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError
 
 from django.utils import timezone
 from datetime import timedelta
@@ -27,23 +27,34 @@ from django.http import FileResponse
 from rest_framework import status
 from django.contrib.auth import get_user_model
 from .utils.pdf_generator import generate_invoice_pdf
+from .utils.idempotency import (
+    get_idempotency_key,
+    check_idempotency,
+    store_idempotency_result,
+    release_idempotency_lock,
+)
+from .throttles import AuthRateThrottle, CheckoutRateThrottle
 from django.db.models import Q
 from rest_framework import serializers
 import sys
 
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import generics, status, viewsets
+from rest_framework import generics, mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import (
     AllowAny,
     IsAuthenticated,
     IsAuthenticatedOrReadOnly,
 )
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
+from django.middleware.csrf import get_token, rotate_token
+from .authenticate import enforce_csrf
 
 from .email_service import (
     async_notify_cancellation,
@@ -52,6 +63,11 @@ from .email_service import (
     send_vendor_new_order_email,
     async_notify_vendors
 )
+from .purchase_requests import merchandise_terms, gift_terms, request_fingerprint, request_conflict
+from .fulfillment import fulfill_order
+from .refunds import fetch_refund_payment, record_processed_refund
+from .settlement import (record_gateway_capture, create_provider_order, checkout_response,
+    settle_gift_capture, gift_response, validate_wallet)
 from .models import (
     Address,
     AdminLog,
@@ -68,17 +84,23 @@ from .models import (
     Wishlist,
     GiftCard,
     GiftCardTransaction,
+    WalletTransaction,
+    PurchaseIntent, ProviderPaymentClaim, ProviderEvent,
+    record_wallet_transaction,
 )
 from .permissions import (
     IsAdminOrOwner,
     IsAdminUser,
+    IsAdminUserOrReadOnly,
     IsOwnerOrReadOnly,
+    IsProductOwnerOrAdmin,
     IsSellerAdminOrReadOnly,
     IsSellerOrAdmin,
 )
 from .serializers import (
     AddressSerializer,
     AdminLogSerializer,
+    AdminUserProfileUpdateSerializer,
     CartItemSerializer,
     CartSerializer,
     CategorySerializer,
@@ -94,6 +116,7 @@ from .serializers import (
     UserProfileUpdateSerializer,
     UserSerializer,
     WishlistSerializer,
+    WalletTransactionSerializer,
 )
 
 User = get_user_model()
@@ -116,16 +139,64 @@ def log_admin_action(user, message):
 # ==========================================
 # 1. USERS & AUTHENTICATION
 # ==========================================
-class UserViewSet(viewsets.ModelViewSet):
+class UserViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
     queryset = User.objects.all()
     permission_classes = [IsAuthenticated]
     lookup_field = 'id'
     pagination_class = StandardResultsSetPagination
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        """
+        SEC-01: Strict tenancy scoping.
+        - Administrators & staff have global visibility across all users.
+        - Standard users and vendors are restricted strictly to their own user record.
+        """
+        user = self.request.user
+        if not user.is_authenticated:
+            return User.objects.none()
+        if getattr(user, 'role', None) == 'admin' or user.is_staff or user.is_superuser:
+            return User.objects.all().order_by('id')
+        return User.objects.filter(id=user.id).order_by('id')
+
+    # ==========================================
+    # SEC-01: Object-level authorization — destroy() enforces admin-only deletion.
+    # CRITICAL INVARIANT: an admin account must always exist (admin panel auth).
+    # An admin may delete any non-admin user freely, but may NEVER reduce the total
+    # count of admin/staff/superuser accounts to zero — this covers both
+    # "other-admin deletion leaving none" and "the last admin self-deletion".
+    def destroy(self, request, *args, **kwargs):
+        is_admin = getattr(request.user, 'role', None) == 'admin' or request.user.is_staff or request.user.is_superuser
+        if not is_admin:
+            return Response({"error": "Account deletion requires administrator privileges."},
+                            status=status.HTTP_403_FORBIDDEN)
+        instance = self.get_object()
+
+        remaining_after = User.objects.filter(
+            Q(role='admin') | Q(is_staff=True) | Q(is_superuser=True)
+        ).exclude(id=instance.id).count()
+        if remaining_after == 0:
+            return Response({"error": "Cannot delete the last administrator account — at least one admin must remain for admin panel access."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {"error": "This account has order history and cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
 
     def get_serializer_class(self):
         if self.action in ['update', 'partial_update']:
+            if IsAdminUser().has_permission(self.request, self):
+                return AdminUserProfileUpdateSerializer
             return UserProfileUpdateSerializer
         if self.action == 'change_password':
             return ChangePasswordSerializer
@@ -155,11 +226,12 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_429_TOO_MANY_REQUESTS
             )
 
-        # 3. Generate the 6-digit OTP
-        otp = str(random.randint(100000, 999999))
+        # 3. Generate the 6-digit OTP using CSPRNG
+        otp = f"{secrets.randbelow(900000) + 100000:06d}"
 
         # 4. Save to Cache
         cache.set(f"profile_otp_{user.id}", otp, timeout=300) # OTP valid for 5 mins
+        cache.delete(f"profile_otp_attempts_{user.id}")        # Reset attempt counter on new OTP
         cache.set(count_key, otp_count + 1, timeout=86400)    # Increment daily count (expires in 24h)
         cache.set(cooldown_key, True, timeout=60)             # Lock the endpoint for 60 seconds
 
@@ -175,7 +247,7 @@ class UserViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
         is_owner = request.user.id == instance.id
-        is_admin = getattr(request.user, 'role', None) == 'admin'
+        is_admin = IsAdminUser().has_permission(request, self)
 
         if not is_owner and not is_admin:
             return Response({"error": "Unauthorized action."}, status=status.HTTP_403_FORBIDDEN)
@@ -183,27 +255,67 @@ class UserViewSet(viewsets.ModelViewSet):
         if 'role' in request.data and not is_admin:
             return Response({"error": "Only admins can modify user roles."}, status=status.HTTP_403_FORBIDDEN)
 
+        serializer = self.get_serializer(instance, data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        new_password = request.data.get('password')
+
+        # Application role management does not authorize changing another account's credentials.
+        changes_email = serializer.validated_data.get('email', instance.email) != instance.email
+        if not is_owner and not request.user.is_superuser and (new_password or changes_email):
+            return Response(
+                {"error": "Cannot change another user's password or recovery email."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if ('password' in request.data or 'phone' in request.data) and not is_admin:
             submitted_otp = request.data.get('otp')
+            attempt_key = f"profile_otp_attempts_{request.user.id}"
+            attempts = cache.get(attempt_key, 0)
+
+            if attempts >= 5:
+                cache.delete(f"profile_otp_{request.user.id}")
+                cache.delete(attempt_key)
+                return Response(
+                    {"error": "Too many failed attempts. OTP has been invalidated."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS
+                )
+
             cached_otp = cache.get(f"profile_otp_{request.user.id}")
 
             if not submitted_otp or not cached_otp or str(cached_otp).strip() != str(submitted_otp).strip():
+                new_attempts = attempts + 1
+                cache.set(attempt_key, new_attempts, timeout=300)
+                if new_attempts >= 5:
+                    cache.delete(f"profile_otp_{request.user.id}")
+                    return Response(
+                        {"error": "Too many failed attempts. OTP has been invalidated."},
+                        status=status.HTTP_429_TOO_MANY_REQUESTS
+                    )
                 return Response({"error": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+            cache.delete(attempt_key)
             cache.delete(f"profile_otp_{request.user.id}")
 
-        new_password = request.data.get('password')
         current_password = request.data.get('current_password')
 
+        password_update = {}
         if new_password:
             if not current_password or not instance.check_password(current_password):
                 return Response({"error": "Current password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+            from django.contrib.auth.password_validation import validate_password
+            from django.core.exceptions import ValidationError as DjangoValidationError
+            try:
+                validate_password(new_password, user=instance)
+            except DjangoValidationError as val_err:
+                return Response({"error": list(val_err.messages)}, status=status.HTTP_400_BAD_REQUEST)
             instance.set_password(new_password)
-            instance.save()
+            password_update['password'] = instance.password
 
         try:
-            return super().update(request, *args, **kwargs)
+            serializer.save(**password_update)
         except Exception:
             return Response({"error": "Profile update failed."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.data)
 
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated], url_path='verify-password')
     def verify_password(self, request):
@@ -242,117 +354,135 @@ class AddressViewSet(viewsets.ModelViewSet):
 
 
 class RegisterView(generics.CreateAPIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     queryset = User.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = []
+    throttle_classes = [AuthRateThrottle]
+
+
+def set_auth_cookies(response, tokens):
+    for name, lifetime in (('access', 'ACCESS_TOKEN_LIFETIME'), ('refresh', 'REFRESH_TOKEN_LIFETIME')):
+        token = tokens.get(name)
+        if token:
+            response.set_cookie(
+                f'{name}_token', token, httponly=True,
+                secure=settings.AUTH_COOKIE_SECURE, samesite=settings.AUTH_COOKIE_SAMESITE,
+                path='/', max_age=int(settings.SIMPLE_JWT[lifetime].total_seconds()),
+            )
+    response['Cache-Control'] = 'no-store'
+
+
+class CSRFTokenView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        response = Response({'csrfToken': get_token(request)})
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 class CookieTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+    throttle_classes = [AuthRateThrottle]
 
     def post(self, request, *args, **kwargs):
+        enforce_csrf(request)
         response = super().post(request, *args, **kwargs)
-
-        if response.status_code == 200:
-            access_token = response.data.get('access')
-            refresh_token = response.data.get('refresh')
-            # 🚀 DYNAMIC SECURITY: Uses Lax/HTTP locally, and None/HTTPS in production
-            is_production = not settings.DEBUG
-
-            if access_token and refresh_token:
-                response.set_cookie(
-                    key='access_token',
-                    value=access_token,
-                    httponly=True,
-                    secure=True,        # 🚀 FORCES HTTPS TRANSMISSION
-                    samesite='None',    # 🚀 ALLOWS CROSS-DOMAIN COOKIES
-                    max_age=300
-                )
-                response.set_cookie(
-                    key='refresh_token',
-                    value=refresh_token,
-                    httponly=True,
-                    secure=True,        # 🚀 FORCES HTTPS TRANSMISSION
-                    samesite='None',    # 🚀 ALLOWS CROSS-DOMAIN COOKIES
-                    max_age=86400
-                )
-                del response.data['access']
-                del response.data['refresh']
-
+        tokens = {name: response.data.pop(name, None) for name in ('access', 'refresh')}
+        set_auth_cookies(response, tokens)
+        rotate_token(request)
+        response.data['csrfToken'] = get_token(request)
         return response
 
 
 class CookieTokenRefreshView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
-        refresh_token = request.COOKIES.get('refresh_token')
-        if refresh_token:
-            request.data['refresh'] = refresh_token
-
-        response = super().post(request, *args, **kwargs)
-
-        if response.status_code == 200:
-            access_token = response.data.get('access')
-
-            # 🚀 DYNAMIC SECURITY: Uses Lax/HTTP locally, and None/HTTPS in production
-            is_production = not settings.DEBUG
-
-            response.set_cookie(
-                key='access_token',
-                value=access_token,
-                httponly=True,
-                secure=is_production,
-                samesite='None' if is_production else 'Lax',
-                max_age=300
-            )
-            del response.data['access']
-
+        enforce_csrf(request)
+        # Cookie wins over a body token, so a supplied body cannot switch the session.
+        token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
+        if not token:
+            raise InvalidToken('Refresh credential is missing.')
+        serializer = self.get_serializer(data={'refresh': token})
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as exc:
+            raise InvalidToken(str(exc)) from exc
+        response = Response({'detail': 'Token refreshed successfully.', 'csrfToken': get_token(request)})
+        set_auth_cookies(response, serializer.validated_data)
         return response
 
 
 class LogoutView(APIView):
-    permission_classes = [IsAuthenticated]
+    authentication_classes = []  # Logout must work even with expired access cookies.
+    permission_classes = [AllowAny]
 
     def post(self, request):
-        response = Response({"success": True, "message": "Logged out successfully."})
-
-        # 🚀 DYNAMIC SECURITY: The deletion request must perfectly match the creation flags
-        is_production = not settings.DEBUG
-        samesite_flag = 'None' if is_production else 'Lax'
-
-        response.delete_cookie('access_token', path='/', samesite=samesite_flag)
-        response.delete_cookie('refresh_token', path='/', samesite=samesite_flag)
-
+        enforce_csrf(request)
+        token = request.COOKIES.get('refresh_token') or request.data.get('refresh')
+        if token:
+            try:
+                RefreshToken(token).blacklist()
+            except TokenError:
+                pass  # Already expired or revoked is a successful logout.
+            except Exception:
+                logger.exception('Logout revocation failed')
+                return Response({'detail': 'Logout failed. Please retry.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        response = Response({'success': True, 'message': 'Logged out successfully.'})
+        for name in ('access_token', 'refresh_token'):
+            response.delete_cookie(name, path='/', samesite=settings.AUTH_COOKIE_SAMESITE)
+            response.cookies[name]['secure'] = settings.AUTH_COOKIE_SECURE
+            response.cookies[name]['httponly'] = True
+        response['Cache-Control'] = 'no-store'
         return response
 
 # ==========================================
 # 2. CORE E-COMMERCE (Catalog)
 # ==========================================
+CATEGORY_LIST_CACHE_KEY = 'category_list_cache'
+CATEGORY_CACHE_TIMEOUT = 3600  # 1 hour
+
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminUserOrReadOnly]
+
+    def list(self, request, *args, **kwargs):
+        cached_data = cache.get(CATEGORY_LIST_CACHE_KEY)
+        if cached_data is not None:
+            return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            cache.set(CATEGORY_LIST_CACHE_KEY, response.data, timeout=CATEGORY_CACHE_TIMEOUT)
+        return response
 
     def perform_create(self, serializer):
         instance = serializer.save()
+        cache.delete(CATEGORY_LIST_CACHE_KEY)
         log_admin_action(self.request.user, f"Created category: '{instance.name}'")
 
     def perform_update(self, serializer):
         instance = self.get_object()
         old_name = instance.name
         new_instance = serializer.save()
+        cache.delete(CATEGORY_LIST_CACHE_KEY)
         if old_name != new_instance.name:
             log_admin_action(self.request.user, f"Renamed Category: '{old_name}' -> '{new_instance.name}'")
 
     def perform_destroy(self, instance):
         name = instance.name
         instance.delete()
+        cache.delete(CATEGORY_LIST_CACHE_KEY)
         log_admin_action(self.request.user, f"Deleted category: '{name}'")
 
 
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsSellerAdminOrReadOnly]
+    # SEC-02: object-level permission enforced on every mutation
+    permission_classes = [IsProductOwnerOrAdmin]
     pagination_class = StandardResultsSetPagination
 
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -430,13 +560,31 @@ class ProductViewSet(viewsets.ModelViewSet):
 # 3. CART & ORDERS
 # ==========================================
 
-class OrderViewSet(viewsets.ModelViewSet):
+def can_manage_orders(user):
+    return user.role == 'admin' or (user.is_staff and user.has_perm('api.change_order'))
+
+
+def can_view_all_orders(user):
+    return can_manage_orders(user) or (user.is_staff and user.has_perm('api.view_order'))
+
+
+class OrderViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
     serializer_class = OrderSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ['status']
     ordering_fields = ['created_at', 'total_price']
+
+    def get_throttles(self):
+        if self.action == 'create_razorpay_order':
+            return [CheckoutRateThrottle()]
+        return super().get_throttles()
 
     def get_queryset(self):
         user = self.request.user
@@ -445,7 +593,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             return queryset.none()
 
-        if getattr(user, 'role', '') == 'admin' or user.is_staff:
+        if can_view_all_orders(user):
             return queryset.all()
 
         return queryset.filter(user=user)
@@ -460,26 +608,40 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
-    def perform_update(self, serializer):
-        user = self.request.user
-        is_admin = getattr(user, 'role', '') == 'admin' or user.is_staff
+    def update(self, request, *args, **kwargs):
+        order = self.get_object()
+        user = request.user
+        if order.user_id != user.pk and not can_manage_orders(user):
+            raise PermissionDenied("Only authorized staff can edit another customer's order.")
+        if 'order_items' in request.data:
+            raise ValidationError({"order_items": "Order items cannot be edited."})
+        if 'status' not in request.data:
+            return super().update(request, *args, **kwargs)
 
-        instance = self.get_object()
-        old_status = instance.status
+        if not can_manage_orders(user):
+            raise ValidationError({"status": "Only authorized staff can change order status."})
+        if set(request.data) != {'status'}:
+            raise ValidationError({"status": "Submit status changes separately."})
 
-        new_status = serializer.validated_data.get('status', old_status)
-        if old_status != new_status and not is_admin:
-            raise serializers.ValidationError({"status": "❌ Permission Denied: Only administrators can update order statuses."})
-
-        new_instance = serializer.save()
-
-        if old_status != new_instance.status:
-            new_instance.order_items.update(status=new_instance.status)
-            log_admin_action(user, f"Order #{new_instance.id} Status: '{old_status}' -> '{new_instance.status}'")
-            self.send_order_status_email(new_instance)
+        new_status = request.data['status']
+        if new_status == 'cancelled':
+            response = self.cancel(request, pk=order.pk)
+            if response.status_code != status.HTTP_200_OK:
+                return response
+            order = Order.objects.get(pk=order.pk)
+        else:
+            try:
+                order, changed = fulfill_order(order.pk, new_status)
+            except ModelValidationError as exc:
+                raise ValidationError({"status": exc.messages}) from exc
+            if changed:
+                log_admin_action(user, f"Updated fulfillment for order #{order.id}: {new_status}")
+                self.send_order_status_email(order)
+        return Response(self.get_serializer(order).data)
 
     def send_order_status_email(self, order):
-        threading.Thread(target=self._send_email_async, args=(order.id,)).start()
+        order_id = order.id
+        transaction.on_commit(lambda: run_async(self._send_email_async, order_id))
 
     def _send_email_async(self, order_id):
         try:
@@ -505,29 +667,134 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
-        order = self.get_object()
-
-        if order.status != 'pending':
-            return Response({"error": "Cannot cancel non-pending order."}, status=status.HTTP_400_BAD_REQUEST)
-
         with transaction.atomic():
+            # 🚀 ADV-FIN-01: Acquire exclusive row-level lock on the Order to eliminate concurrent cancellation races
+            try:
+                order = self.get_queryset().select_related(None).prefetch_related(None).select_for_update().get(id=pk)
+            except Order.DoesNotExist:
+                return Response({"error": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            if order.user_id != request.user.pk and not can_manage_orders(request.user):
+                raise PermissionDenied("Only authorized staff can cancel another customer's order.")
+            if order.status not in ['pending', 'pending_payment', 'paid', 'processing']:
+                return Response({"error": "Cannot cancel non-pending order."}, status=status.HTTP_400_BAD_REQUEST)
+
+            intent = PurchaseIntent.objects.select_for_update().filter(order=order, purpose='merchandise').first()
+            if not intent:
+                return Response({'error': 'Historical purchase requires reconciliation before cancellation.'}, status=409)
+            if ProviderPaymentClaim.objects.filter(intent=intent, refunds__isnull=False).exists():
+                return Response({'error': 'Processed refunds require reconciliation before cancellation.'}, status=409)
+            try:
+                validate_wallet(intent, order)
+                for payment in order.payment.filter(status='completed').exclude(payment_method='wallet'):
+                    if not payment.verified_at or not ProviderPaymentClaim.objects.filter(
+                        payment_id=payment.transaction_id, intent=intent, state='captured',
+                        amount=int(payment.amount * 100), currency=intent.currency,
+                    ).exists():
+                        raise ModelValidationError('Payment lacks trusted claim evidence.')
+            except ModelValidationError:
+                return Response({'error': 'Purchase requires reconciliation before cancellation.'}, status=409)
+
             order.status = 'cancelled'
-            order.save()
+            order.save(update_fields=['status'])
 
-            for item in order.order_items.all():
-                item.status = 'cancelled'
-                item.save()
+            # Match checkout's user-before-products lock order.
+            User.objects.select_for_update().get(pk=order.user_id)
+            # Deterministic product locking in ascending ID order to eliminate deadlocks
+            order_items = list(order.order_items.select_related('product').all())
+            items_to_restock = [it for it in order_items if it.product and it.status != 'cancelled']
+            sorted_product_ids = sorted({it.product.id for it in items_to_restock})
 
-                if item.product:
-                    product = Product.objects.select_for_update().get(id=item.product.id)
-                    product.stock += item.quantity
-                    product.save()
+            if sorted_product_ids:
+                products_locked = {
+                    p.id: p for p in Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
+                }
+                for it in items_to_restock:
+                    it.status = 'cancelled'
+                    it.save()
+                    p = products_locked.get(it.product.id)
+                    if p:
+                        p.stock += it.quantity
+                        p.save()
+
+            for it in order_items:
+                if it.status != 'cancelled':
+                    it.status = 'cancelled'
+                    it.save()
+
+            # Restore wallet reservation if any was deducted at order creation
+            wallet_payments = Payment.objects.select_for_update().filter(
+                order=order,
+                payment_method='wallet',
+                status='completed'
+            )
+            if wallet_payments.exists():
+                order_user = User.objects.select_for_update().get(id=order.user_id)
+                for wp in wallet_payments:
+                    record_wallet_transaction(
+                        user=order_user,
+                        amount=wp.amount,
+                        transaction_type='REFUND_ORDER',
+                        reference_id=f"ORDER-{order.id}",
+                        description=f"Refunded wallet payment for Cancelled Order #{order.id}"
+                    )
+                    wp.status = 'refunded'
+                    wp.save(update_fields=['status'])
+
+            # 🚀 FIN-16 / ADV-FIN-03: Stage completed online payments for gateway refund
+            # Note: We mark them 'refund_pending' and execute the network refund OUTSIDE
+            # the atomic transaction so external HTTP latency never blocks DB row locks.
+            gateway_payments = Payment.objects.select_for_update().filter(
+                order=order,
+                status='completed'
+            ).exclude(payment_method='wallet')
+
+            gateway_refunds_to_process = []
+            for gp in gateway_payments:
+                if gp.transaction_id:
+                    gp.status = 'refund_pending'
+                    gp.save(update_fields=['status'])
+                    ProviderPaymentClaim.objects.filter(payment_id=gp.transaction_id).update(state='refund_pending')
+                    gateway_refunds_to_process.append({
+                        'payment_id': gp.id,
+                        'transaction_id': gp.transaction_id,
+                        'amount': gp.amount,
+                        'order_id': order.id
+                    })
+                else:
+                    gp.status = 'refund_failed'
+                    gp.save(update_fields=['status'])
+
+        # Outside atomic transaction: Execute network refund API calls non-blockingly
+        if gateway_refunds_to_process:
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+            for item in gateway_refunds_to_process:
+                gp_id = item['payment_id']
+                tx_id = item['transaction_id']
+                amount = item['amount']
+                ord_id = item['order_id']
+                try:
+                    refund_data = {
+                        'amount': int(amount * 100),
+                        'notes': {'order_id': str(ord_id), 'reason': 'Order cancelled by customer'}
+                    }
+                    refund = client.payment.refund(tx_id, refund_data, timeout=5)
+                    if refund.get('status') == 'processed':
+                        if refund.get('payment_id') != tx_id:
+                            raise ModelValidationError('Refund response is not bound to the requested payment.')
+                        record_processed_refund(refund, fetch_refund_payment(client, refund))
+                    # A pending/unknown response remains reserved for the signed webhook.
+
+                except Exception as refund_err:
+                    logger.error(f"[GATEWAY REFUND ERROR] Failed to refund {tx_id}: {refund_err}")
+                    Payment.objects.filter(id=gp_id, status='refund_pending').update(status='refund_failed')
 
         if getattr(request.user, 'role', '') == 'admin' or request.user.is_staff:
             log_admin_action(request.user, f"Cancelled Order #{order.id}")
 
         self.send_order_status_email(order)
-        async_notify_cancellation(order)
+        transaction.on_commit(lambda: async_notify_cancellation(order))
+        invalidate_invoice_cache(order.id)
 
         return Response({"message": "Order cancelled successfully."}, status=status.HTTP_200_OK)
 
@@ -536,186 +803,291 @@ class OrderViewSet(viewsets.ModelViewSet):
     # ==========================================
     @action(detail=False, methods=['post'], url_path='create-razorpay-order')
     def create_razorpay_order(self, request):
-        use_wallet = request.data.get('use_wallet') == True
+        """
+        GOLD STANDARD: Authoritative server-side pricing & stock reservation.
+        - Client-supplied total_price/price are DISCARDED. Prices recomputed from Product rows.
+        - Products + user locked via select_for_update() in deterministic sorted order (prevents deadlock).
+        - Stock is RESERVED atomically BEFORE calling the payment gateway.
+        """
+        idem_key = get_idempotency_key(request)
+        if idem_key and len(idem_key) > 128:
+            return Response({'error': 'Idempotency key is too long.'}, status=400)
+
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
+        order_items_input = request.data.get('order_items', [])
+
+        # --- INPUT VALIDATION (before any DB work) ---
+        if not order_items_input or not isinstance(order_items_input, list):
+            release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+            return Response({"error": "Order items list is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Deduplicate quantities per product + basic validation
+        item_qty_map = {}
+        for item in order_items_input:
+            if not isinstance(item, dict):
+                release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                return Response({"error": "Each order item must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+            p_id = item.get('product')
+            qty = item.get('quantity', 0)
+            if type(p_id) is not int or p_id <= 0 or type(qty) is not int or qty <= 0:
+                release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                return Response(
+                    {"error": f"Invalid quantity for product {p_id}. Provide a positive integer."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            item_qty_map[p_id] = item_qty_map.get(p_id, 0) + qty
+
+        try:
+            terms = merchandise_terms(request.data, item_qty_map)
+        except ModelValidationError as exc:
+            return Response({'error': exc.messages[0]}, status=400)
+        use_wallet = terms['use_wallet']
+
+        # --- SERVER-AUTHORITATIVE PRICING & STOCK LOCK ---
+        sorted_product_ids = sorted(item_qty_map.keys())
 
         with transaction.atomic():
-            order = Order.objects.create(
-                user=request.user,
-                shipping_address=request.data.get('shipping_address'),
-                contact_phone=request.data.get('contact_phone'),
-                total_price=request.data.get('total_price'),
-                status='pending'
-            )
-
-            for item_data in request.data.get('order_items', []):
-                product = Product.objects.get(id=item_data['product'])
-                OrderItem.objects.create(
-                                    order=order,
-                                    product=product,
-                                    vendor=product.vendor,
-                                    quantity=item_data['quantity'],
-                                    price=item_data['price']
-                                )
-
-            total_price = Decimal(str(order.total_price))
-            remaining_amount = total_price
-            wallet_deducted = Decimal('0.00')
-
-            # We need a select_for_update to lock the user row to prevent race conditions on wallet balance
+            # Lock the user FIRST (wallet race guard)
             user = User.objects.select_for_update().get(id=request.user.id)
 
-            if use_wallet and user.wallet_balance > 0:
-                if user.wallet_balance >= total_price:
-                    # Full coverage by wallet
-                    wallet_deducted = total_price
-                    user.wallet_balance -= total_price
-                    user.save()
+            if idem_key:
+                previous = PurchaseIntent.objects.filter(purchaser=user, purpose='merchandise', idempotency_key=idem_key).first()
+                if previous:
+                    conflict = request_conflict(previous, terms)
+                    if conflict:
+                        return Response(conflict, status=409)
+                    try:
+                        return Response(checkout_response(previous), status=201)
+                    except ModelValidationError:
+                        return Response({'error': 'Purchase requires reconciliation.', 'intent_id': previous.pk}, status=409)
 
-                    order.status = 'processing'
-                    order.save()
+            # Lock all requested products in a DETERMINISTIC order (sorted IDs)
+            # Deterministic lock ordering = deadlock freedom across concurrent requests
+            products = Product.objects.select_for_update().filter(id__in=sorted_product_ids).order_by('id')
+            product_map = {p.id: p for p in products}
+
+            if len(product_map) != len(sorted_product_ids):
+                release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                return Response({"error": "One or more products are unavailable."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Recompute total_price and validate availability from DATABASE prices
+            server_total_price = Decimal('0.00')
+            verified_items = []
+            for p_id in sorted_product_ids:
+                product = product_map[p_id]
+                requested_qty = item_qty_map[p_id]
+
+                if not product.is_active or product.approval_status != 'approved':
+                    release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                    return Response({"error": f"Product '{product.name}' is not available for purchase."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                if product.stock < requested_qty:
+                    release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                    return Response({"error": f"Insufficient stock for '{product.name}'."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+
+                item_subtotal = product.price * requested_qty
+                server_total_price += item_subtotal
+                verified_items.append((product, requested_qty, product.price))
+
+            if server_total_price <= 0:
+                release_idempotency_lock(request.user.id, "create_razorpay_order", idem_key)
+                return Response({"error": "Order total must be positive."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # --- ATOMIC STOCK RESERVATION ---
+            for product, qty, price in verified_items:
+                product.stock -= qty
+                product.save(update_fields=['stock'])
+
+            # --- CREATE ORDER WITH SERVER-COMPUTED TOTAL (client price discarded) ---
+            order = Order.objects.create(
+                user=user,
+                shipping_address=terms['shipping_address'],
+                contact_phone=terms['contact_phone'],
+                total_price=server_total_price,  # authoritative
+                status='pending_payment'
+            )
+            for product, qty, price in verified_items:
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    vendor=product.vendor,
+                    quantity=qty,
+                    price=price,  # authoritative
+                    status='pending'
+                )
+
+            # --- WALLET LOGIC (server-computed, no client price input) ---
+            remaining_amount = server_total_price
+            wallet_deducted = Decimal('0.00')
+            wallet_debit = None
+
+            if use_wallet and user.wallet_balance > 0:
+                if user.wallet_balance >= server_total_price:
+                    # Full coverage by wallet — reserve immediately
+                    wallet_deducted = server_total_price
+                    wallet_debit = record_wallet_transaction(
+                        user=user,
+                        amount=wallet_deducted,
+                        transaction_type='DEBIT_ORDER',
+                        reference_id=f"ORDER-{order.id}",
+                        description=f"Full wallet payment for Order #{order.id}"
+                    )
 
                     unique_txn_id = f"TXN-WALLET-{uuid.uuid4().hex[:8].upper()}"
-
                     payment = Payment.objects.create(
                         order=order,
                         payment_method='wallet',
                         transaction_id=unique_txn_id,
-                        amount=total_price,
-                        status='completed'
+                        amount=wallet_deducted,
+                        status='completed',
+                        verified_at=timezone.now()
                     )
 
-                    for item in order.order_items.all():
-                        item.product.stock -= item.quantity
-                        item.product.save()
-                        item.status = 'processing'
-                        item.save()
+                    intent = PurchaseIntent.objects.create(
+                        purpose='merchandise', purchaser=user, order=order, expected_amount=0,
+                        wallet_amount=int(wallet_deducted * 100), wallet_debit=wallet_debit,
+                        state='settled', idempotency_key=idem_key or None,
+                        request_fingerprint=request_fingerprint(terms),
+                    )
+                    # Fully paid via wallet — finalize
+                    order.status = 'processing'
+                    order.save(update_fields=['status'])
 
                     CartItem.objects.filter(cart__user=request.user).delete()
                     self.send_order_status_email(order)
+                    transaction.on_commit(lambda: async_notify_vendors(order))
 
-                    return Response({
+                    resp_data = {
                         "order_id": order.id,
                         "payment_complete": True,
                         "message": "Paid fully with Wallet Balance.",
-                        "payment": PaymentSerializer(payment).data
-                    }, status=status.HTTP_201_CREATED)
+                        "payment": PaymentSerializer(payment).data if 'payment' in locals() else None
+                    }
+                    store_idempotency_result(request.user.id, "create_razorpay_order", idem_key, resp_data, status.HTTP_201_CREATED)
+                    return Response(resp_data, status=status.HTTP_201_CREATED)
                 else:
-                    # Partial coverage
+                    # Partial coverage — reserve the wallet portion atomically (deduct now, reconcile on payment)
                     wallet_deducted = user.wallet_balance
-                    remaining_amount = total_price - wallet_deducted
-                    # Don't deduct from user here yet! We deduct in verify_razorpay_payment or we can deduct here.
-                    # It's safer to just pass it in notes and let verify do it, or lock here.
-                    # Actually, we shouldn't deduct until payment succeeds.
+                    wallet_debit = record_wallet_transaction(
+                        user=user,
+                        amount=wallet_deducted,
+                        transaction_type='DEBIT_ORDER',
+                        reference_id=f"ORDER-{order.id}",
+                        description=f"Partial wallet payment reservation for Order #{order.id}"
+                    )
 
-        # 2. Initialize Razorpay and hide our Django Order ID inside the session notes
+                    unique_txn_id = f"TXN-WALLET-{uuid.uuid4().hex[:8].upper()}"
+                    Payment.objects.create(
+                        order=order,
+                        payment_method='wallet',
+                        transaction_id=unique_txn_id,
+                        amount=wallet_deducted,
+                        status='completed',
+                        verified_at=timezone.now()
+                    )
+
+                    remaining_amount = server_total_price - wallet_deducted
+            else:
+                remaining_amount = server_total_price
+
+            intent = PurchaseIntent.objects.create(
+                purpose='merchandise', purchaser=user, order=order,
+                expected_amount=int(remaining_amount * 100), wallet_amount=int(wallet_deducted * 100),
+                wallet_debit=wallet_debit, idempotency_key=idem_key or None,
+                request_fingerprint=request_fingerprint(terms),
+            )
+
         client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-        amount_in_paise = int(remaining_amount * 100)
-
-        notes = {
-            "django_order_id": order.id
-        }
-        if use_wallet and wallet_deducted > 0:
-            notes["wallet_deducted"] = str(wallet_deducted)
-
-        razorpay_order = client.order.create({
-            "amount": amount_in_paise,
-            "currency": "INR",
-            "payment_capture": 1,
-            "notes": notes
-        })
-
-        return Response({
-            "order_id": order.id,
-            "razorpay_order_id": razorpay_order['id'],
-            "amount": razorpay_order['amount'],
-            "currency": razorpay_order['currency'],
-            "key_id": settings.RAZORPAY_KEY_ID
-        }, status=status.HTTP_201_CREATED)
+        try:
+            create_provider_order(intent, client)
+        except Exception:
+            logger.warning('Provider order outcome unknown for intent %s', intent.pk)
+            return Response({'error': 'Payment initialization requires reconciliation. Do not pay or create another purchase.',
+                             'intent_id': intent.pk, 'order_id': order.pk}, status=503)
+        return Response(checkout_response(intent), status=201)
 
     @action(detail=False, methods=['post'], url_path='verify-razorpay-payment')
     def verify_razorpay_payment(self, request):
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_signature = request.data.get('razorpay_signature')
-        django_order_id = request.data.get('order_id')
-
-        # Here fetching payment_details is correct because we are calling the API
-        payment_details = client.payment.fetch(razorpay_payment_id)
-        actual_method = payment_details.get('method', 'razorpay')
+        # Authorization must precede payment queries, replay responses and provider calls.
+        if not isinstance(request.data, dict):
+            return Response({'success': False, 'message': 'Invalid verification request.'}, status=400)
+        order_id = request.data.get('order_id')
+        payment_id = request.data.get('razorpay_payment_id')
+        gateway_order_id = request.data.get('razorpay_order_id')
+        invalid = {"success": False, "message": "Payment does not match this order."}
+        if (
+            isinstance(order_id, bool) or not isinstance(order_id, (str, int))
+            or len(str(order_id)) > 19 or not str(order_id).isascii() or not str(order_id).isdigit()
+            or not 0 < int(order_id) <= 9223372036854775807
+            or not isinstance(payment_id, str) or not 1 <= len(payment_id) <= 100
+            or not isinstance(gateway_order_id, str) or not 1 <= len(gateway_order_id) <= 100
+        ):
+            return Response(invalid, status=status.HTTP_400_BAD_REQUEST)
 
         try:
+            with transaction.atomic():
+                order = Order.objects.select_for_update().filter(pk=order_id, user=request.user).first()
+                if not order or not order.gateway_order_id or order.gateway_order_id != gateway_order_id:
+                    raise ModelValidationError("Payment does not match this order.")
+                intent = PurchaseIntent.objects.filter(order=order, purchaser=request.user, purpose='merchandise',
+                    provider_order_id=gateway_order_id).first()
+                if not intent or intent.state not in ('pending', 'settled'):
+                    raise ModelValidationError('Purchase lacks trusted settlement terms.')
+                claim = ProviderPaymentClaim.objects.filter(payment_id=payment_id).first()
+                if claim and (claim.intent_id != intent.pk or claim.state != 'captured'):
+                    raise ModelValidationError('Payment is unavailable for this purchase.')
+                payment = order.payment.filter(transaction_id=payment_id).first()
+                if payment and payment.verified_at:
+                    if not claim or intent.state != 'settled' or payment.status != 'completed' or order.status not in Order.FULFILLABLE_STATUSES:
+                        raise ModelValidationError("Payment is no longer settled.")
+                    order.require_verified_settlement()
+                    return Response({
+                        "success": True, "message": "Payment verified successfully!",
+                        "order_id": order.id, "payment": PaymentSerializer(payment).data,
+                    })
+                if Payment.objects.filter(transaction_id=payment_id).exclude(order=order).exists():
+                    raise ModelValidationError("Payment does not match this order.")
+                if order.status not in ('pending', 'pending_payment'):
+                    raise ModelValidationError("Order no longer accepts payments.")
+
+            signature = request.data.get('razorpay_signature')
+            if not isinstance(signature, str) or not 1 <= len(signature) <= 256:
+                raise ModelValidationError("Invalid payment signature.")
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
             client.utility.verify_payment_signature({
-                'razorpay_order_id': razorpay_order_id,
-                'razorpay_payment_id': razorpay_payment_id,
-                'razorpay_signature': razorpay_signature
+                'razorpay_order_id': order.gateway_order_id,
+                'razorpay_payment_id': payment_id,
+                'razorpay_signature': signature,
             })
+            payment_details = client.payment.fetch(payment_id, timeout=5)
+            if payment_details.get('id') != payment_id:
+                raise ModelValidationError("Payment ID does not match the gateway response.")
 
             with transaction.atomic():
-                order = Order.objects.get(id=django_order_id, user=request.user)
-                user = User.objects.select_for_update().get(id=request.user.id)
-
-                wallet_deducted_str = payment_details.get('notes', {}).get('wallet_deducted')
-                if wallet_deducted_str:
-                    wallet_deducted = Decimal(wallet_deducted_str)
-                    if wallet_deducted > 0:
-                        if user.wallet_balance >= wallet_deducted:
-                            user.wallet_balance -= wallet_deducted
-                            user.save()
-    
-                            # We also register a separate payment record for the wallet portion
-                            Payment.objects.create(
-                                order=order,
-                                payment_method='wallet',
-                                transaction_id=f'wallet_{uuid.uuid4().hex[:8]}_split',
-                                amount=wallet_deducted,
-                                status='completed'
-                            )
-                        else:
-                            return Response({"success": False, "message": "Payment verification failed: Insufficient wallet balance to fulfill split payment deduction."}, status=status.HTTP_400_BAD_REQUEST)
-
-                payment, created = Payment.objects.get_or_create(
-                    order=order,
-                    defaults={
-                        'payment_method': actual_method,
-                        'transaction_id': razorpay_payment_id,
-                        'amount': Decimal(str(payment_details.get('amount', 0))) / 100, # actual amount paid via razorpay
-                        'status': 'completed'
-                    }
-                )
-
-                if created:
-                    # 🚀 FIX 2: Strict indentation to prevent double-deducting stock
-                    if order.status == 'cancelled':
-                        order.status = 'pending'
-                        order.save()
-
-                        # Re-deduct the stock and un-cancel the items
-                        for item in order.order_items.all():
-                            item.status = 'pending'
-                            item.save()
-                            if item.product:
-                                product = Product.objects.select_for_update().get(id=item.product.id)
-                                product.stock -= item.quantity
-                                product.save()
-
-                    # Safely clear user's shopping cart (Happens for all successful payments)
-                    CartItem.objects.filter(cart__user=request.user).delete()
-
-            self.send_order_status_email(order)
-            # async_notify_vendors(order)
-            # log_admin_action(...)
-
-            return Response({
-                "success": True,
-                "message": "Payment verified successfully!",
-                "order_id": order.id,
-                "payment": PaymentSerializer(payment).data
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            return Response({"success": False, "message": str(e)}, status=400)
+                order = Order.objects.select_for_update().get(pk=order.pk, user=request.user)
+                if order.status == 'cancelled':
+                    raise ModelValidationError("This order was cancelled. Check its payment or refund status.")
+                payment, finalized = record_gateway_capture(order, payment_details)
+                if payment.status != 'completed':
+                    raise ModelValidationError("Payment is no longer settled.")
+                order.require_verified_settlement()
+                if finalized:
+                    self.send_order_status_email(order)
+                    transaction.on_commit(lambda: async_notify_vendors(order))
+                resp_data = {
+                    "success": True, "message": "Payment verified successfully!",
+                    "order_id": order.id, "payment": PaymentSerializer(payment).data,
+                }
+            return Response(resp_data)
+        except ModelValidationError as exc:
+            return Response({"success": False, "message": exc.messages[0]}, status=status.HTTP_400_BAD_REQUEST)
+        except razorpay.errors.SignatureVerificationError:
+            return Response({"success": False, "message": "Invalid payment signature."}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception("Payment verification failed")
+            return Response({"success": False, "message": "Payment outcome is unknown. Retry this same purchase."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
 class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
@@ -733,11 +1105,15 @@ class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = super().get_queryset()
 
         # Admin / staff / superuser: full platform visibility
-        if getattr(user, 'role', '') == 'admin' or user.is_staff or user.is_superuser:
+        if can_view_all_orders(user):
             pass
         # Vendor: visible if they sold the item or if they are the buyer
         elif getattr(user, 'role', '') == 'seller':
-            queryset = queryset.filter(Q(order__user=user) | Q(vendor=user)).distinct()
+            queryset = queryset.filter(
+                Q(order__user=user) | (
+                    Q(vendor=user, order__in=Order.objects.fulfillable()) & ~Q(status='cancelled')
+                )
+            )
         # Customer: strictly limited to items in orders they placed
         else:
             queryset = queryset.filter(order__user=user)
@@ -855,18 +1231,34 @@ class CouponViewSet(viewsets.ModelViewSet):
         log_admin_action(self.request.user, f"Deleted Promo Code: '{code}'")
 
 
-class PaymentViewSet(viewsets.ModelViewSet):
-    queryset = Payment.objects.select_related('order').all()
+class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Payment.objects.none()
     serializer_class = PaymentSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = StandardResultsSetPagination
 
-    def perform_update(self, serializer):
-        instance = self.get_object()
-        old_status = instance.status
-        new_instance = serializer.save()
-        if old_status != new_instance.status:
-            log_admin_action(self.request.user, f"Payment Tx #{new_instance.transaction_id} Status: '{old_status}' -> '{new_instance.status}'")
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return Payment.objects.none()
+        if can_view_all_orders(user):
+            return Payment.objects.select_related('order').all().order_by('-created_at')
+        return Payment.objects.select_related('order').filter(order__user=user).order_by('-created_at')
+
+
+class WalletTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = WalletTransaction.objects.none()
+    serializer_class = WalletTransactionSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return WalletTransaction.objects.none()
+        if getattr(user, 'role', '') == 'admin' or user.is_staff or user.is_superuser:
+            return WalletTransaction.objects.select_related('user').all().order_by('-created_at')
+        return WalletTransaction.objects.filter(user=user).order_by('-created_at')
 
 
 class AdminLogViewSet(viewsets.ModelViewSet):
@@ -889,7 +1281,7 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
         if getattr(user, 'role', '') == 'admin':
             return base_qs
         if getattr(user, 'role', '') == 'seller':
-            return base_qs.filter(vendor=user)
+            return base_qs.filter(vendor=user, order__in=Order.objects.fulfillable()).exclude(status='cancelled')
 
         return OrderItem.objects.none()
 
@@ -905,24 +1297,16 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        if new_status not in ['shipped', 'delivered', 'cancelled']:
-            return Response({"error": "Invalid status"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            _, changed = fulfill_order(
+                item.order_id, new_status, item_id=item.pk,
+                vendor_id=None if user.role == 'admin' else user.pk,
+            )
+        except ModelValidationError as exc:
+            raise ValidationError({"status": exc.messages}) from exc
 
-        item.status = new_status
-        item.save()
-
-        order = item.order
-        all_items = order.order_items.all()
-
-        if all(i.status == 'delivered' for i in all_items):
-            order.status = 'delivered'
-        elif any(i.status == 'shipped' for i in all_items):
-            order.status = 'shipped'
-        elif all(i.status == 'cancelled' for i in all_items):
-            order.status = 'cancelled'
-        order.save()
-
-        self.notify_customer_async(item)
+        if changed:
+            transaction.on_commit(lambda: self.notify_customer_async(changed[0]))
         return Response({"message": f"Item marked as {new_status}"}, status=status.HTTP_200_OK)
 
     def notify_customer_async(self, item):
@@ -932,7 +1316,7 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
                 payment = Payment.objects.filter(order=order).first()
 
                 if payment:
-                    payment_method_display = payment.get_payment_method_display()
+                    payment_method_display = payment.payment_method.capitalize()
                     transaction_id_display = payment.transaction_id or "Verified Transaction"
                 else:
                     payment_method_display = "Completed"
@@ -951,14 +1335,16 @@ class VendorSalesViewSet(viewsets.ReadOnlyModelViewSet):
             except Exception as e:
                 logger.error(f"[EMAIL ERROR] ❌ Failed to notify customer about item {item.id} status: {e!s}")
 
-        threading.Thread(target=send_email).start()
+        run_async(send_email)
 
 
 # ==========================================
 # 6. PASSWORD RESET VIA EMAIL OTP ENDPOINTS
 # ==========================================
 class RequestPasswordResetView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
+    throttle_classes = [AuthRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').strip()
@@ -970,8 +1356,8 @@ class RequestPasswordResetView(APIView):
         if not user:
             return Response({"error": "No account found with this email address."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Generate 6-digit OTP and cache it using the normalized lower-case email as the key
-        otp = str(random.randint(100000, 999999))
+        # Generate 6-digit OTP using CSPRNG and cache it using the normalized lower-case email as the key
+        otp = f"{secrets.randbelow(900000) + 100000:06d}"
         normalized_email = email.lower()
 
         cache.set(f"pwd_reset_{normalized_email}", otp, timeout=300)
@@ -982,7 +1368,9 @@ class RequestPasswordResetView(APIView):
 
 
 class VerifyOTPView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
+    throttle_classes = [AuthRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').strip().lower()
@@ -991,18 +1379,33 @@ class VerifyOTPView(APIView):
         if not email or not otp:
             return Response({"error": "Email and OTP are required."}, status=status.HTTP_400_BAD_REQUEST)
 
+        attempt_key = f"pwd_reset_attempts_{email}"
+        attempts = cache.get(attempt_key, 0)
+        if attempts >= 5:
+            cache.delete(f"pwd_reset_{email}")
+            cache.delete(attempt_key)
+            return Response({"error": "Too many failed attempts. OTP has been invalidated."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         cached_otp = cache.get(f"pwd_reset_{email}")
 
         if not cached_otp or str(cached_otp).strip() != str(otp).strip():
+            new_attempts = attempts + 1
+            cache.set(attempt_key, new_attempts, timeout=300)
+            if new_attempts >= 5:
+                cache.delete(f"pwd_reset_{email}")
+                return Response({"error": "Too many failed attempts. OTP has been invalidated."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
             return Response({"error": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
 
+        cache.delete(attempt_key)
         return Response({"detail": "OTP verified successfully."}, status=status.HTTP_200_OK)
 
 
 from django.db import transaction, connection
 
 class ConfirmPasswordResetView(APIView):
+    authentication_classes = []  # Public credential/OTP flow, independent of an expired session.
     permission_classes = [AllowAny]
+    throttle_classes = [AuthRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').strip().lower()
@@ -1012,9 +1415,23 @@ class ConfirmPasswordResetView(APIView):
         if not email or not otp or not new_password:
             return Response({"error": "All fields are required."}, status=status.HTTP_400_BAD_REQUEST)
 
+        attempt_key = f"pwd_reset_attempts_{email}"
+        attempts = cache.get(attempt_key, 0)
+        if attempts >= 5:
+            cache.delete(f"pwd_reset_{email}")
+            cache.delete(attempt_key)
+            return Response({"error": "Too many failed attempts. OTP has been invalidated."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         cached_otp = cache.get(f"pwd_reset_{email}")
         if not cached_otp or str(cached_otp).strip() != str(otp).strip():
+            new_attempts = attempts + 1
+            cache.set(attempt_key, new_attempts, timeout=300)
+            if new_attempts >= 5:
+                cache.delete(f"pwd_reset_{email}")
+                return Response({"error": "Too many failed attempts. OTP has been invalidated."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
             return Response({"error": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache.delete(attempt_key)
 
         # Force atomic transaction to ensure it commits
         try:
@@ -1022,6 +1439,14 @@ class ConfirmPasswordResetView(APIView):
                 user = User.objects.filter(email__iexact=email).first()
                 if not user:
                     return Response({"error": "User not found."}, status=status.HTTP_400_BAD_REQUEST)
+
+                # ADV-SEC-02: Enforce password complexity validation
+                from django.contrib.auth.password_validation import validate_password
+                from django.core.exceptions import ValidationError as DjangoValidationError
+                try:
+                    validate_password(new_password, user=user)
+                except DjangoValidationError as val_err:
+                    return Response({"error": list(val_err.messages)}, status=status.HTTP_400_BAD_REQUEST)
 
                 logger.debug(f"[DEBUG] Updating password for user ID: {user.pk} ({user.email})")
                 user.set_password(new_password)
@@ -1042,6 +1467,19 @@ class ConfirmPasswordResetView(APIView):
             return Response({"error": "Internal database error during password reset."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+INVOICE_PDF_CACHE_TIMEOUT = 86400  # 24 hours
+
+
+def get_invoice_cache_key(order_id, status_str):
+    return f"invoice_pdf_{order_id}_{status_str}"
+
+
+def invalidate_invoice_cache(order_id):
+    """Invalidates all cached invoice variants for an order."""
+    for s in ['pending_payment', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded', 'failed', 'paid']:
+        cache.delete(get_invoice_cache_key(order_id, s))
+
+
 class DownloadInvoiceView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1052,12 +1490,32 @@ class DownloadInvoiceView(APIView):
             if order.user != request.user and getattr(request.user, 'role', None) != 'admin':
                 return Response({"error": "Unauthorized access to this invoice."}, status=status.HTTP_403_FORBIDDEN)
 
+            filename = f"Invoice_INV-{order.id:05d}.pdf"
+            cache_key = get_invoice_cache_key(order.id, order.status)
+
+            cached_pdf_bytes = cache.get(cache_key)
+            if cached_pdf_bytes:
+                return FileResponse(
+                    io.BytesIO(cached_pdf_bytes),
+                    as_attachment=True,
+                    filename=filename,
+                    content_type='application/pdf'
+                )
+
             # Generate PDF buffer
             pdf_buffer = generate_invoice_pdf(order)
+            pdf_bytes = pdf_buffer.getvalue()
+
+            # Cache rendered PDF
+            cache.set(cache_key, pdf_bytes, timeout=INVOICE_PDF_CACHE_TIMEOUT)
 
             # Return file response stream
-            filename = f"Invoice_INV-{order.id:05d}.pdf"
-            return FileResponse(pdf_buffer, as_attachment=True, filename=filename, content_type='application/pdf')
+            return FileResponse(
+                io.BytesIO(pdf_bytes),
+                as_attachment=True,
+                filename=filename,
+                content_type='application/pdf'
+            )
 
         except Order.DoesNotExist:
             return Response({"error": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -1075,163 +1533,205 @@ from django.views.decorators.csrf import csrf_exempt
 
 @csrf_exempt
 def razorpay_webhook(request):
-    if request.method == "POST":
-        webhook_secret = settings.RAZORPAY_WEBHOOK_SECRET
-        webhook_signature = request.headers.get('X-Razorpay-Signature', '')
-
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
-        try:
-            client.utility.verify_webhook_signature(
-                request.body.decode('utf-8'),
-                webhook_signature,
-                webhook_secret
-            )
-        except razorpay.errors.SignatureVerificationError:
-            return HttpResponse(status=400)
-
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+    try:
+        client.utility.verify_webhook_signature(request.body.decode('utf-8'),
+            request.headers.get('X-Razorpay-Signature', ''), settings.RAZORPAY_WEBHOOK_SECRET)
         payload = json.loads(request.body)
+        if not isinstance(payload, dict):
+            raise ValueError()
         event = payload.get('event')
-        payment_entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
-        django_order_id = payment_entity.get('notes', {}).get('django_order_id')
-
-        # 🚀 FIX 1: Extracted 'method' safely from the payment_entity dictionary
-        actual_method = payment_entity.get('method', 'razorpay')
-
-        if django_order_id:
-            with transaction.atomic():
-                order = Order.objects.filter(id=django_order_id).first()
-
-                if order:
-                    # 1. PAYMENT CAPTURED (Success or Retry Success)
-                    if event == 'payment.captured':
-                        transaction_id = payment_entity.get('id')
-
-                        if not Payment.objects.filter(transaction_id=transaction_id).exists():
-                            Payment.objects.create(
-                                order=order,
-                                payment_method=actual_method,
-                                transaction_id=transaction_id,
-                                amount=order.total_price,
-                                status='completed'
-                            )
-
-                            # Revive the order if a previous attempt failed
-                            if order.status == 'cancelled':
-                                order.status = 'pending'
-                                order.save()
-
-                                for item in order.order_items.all():
-                                    item.status = 'pending'
-                                    item.save()
-                                    if item.product:
-                                        product = Product.objects.select_for_update().get(id=item.product.id)
-                                        product.stock -= item.quantity
-                                        product.save()
-
-                            CartItem.objects.filter(cart__user=order.user).delete()
-
-                    # 2. PAYMENT FAILED (Declined / Dropped)
-                    elif event == 'payment.failed':
-                        if order.status == 'pending':
-                            order.status = 'cancelled'
-                            order.save()
-
-                            for item in order.order_items.all():
-                                item.status = 'cancelled'
-                                item.save()
-                                if item.product:
-                                    product = Product.objects.select_for_update().get(id=item.product.id)
-                                    product.stock += item.quantity
-                                    product.save()
-
+        payment = payload.get('payload', {}).get('payment', {}).get('entity', {})
+        refund = payload.get('payload', {}).get('refund', {}).get('entity', {})
+        if not isinstance(payment, dict) or not isinstance(refund, dict):
+            raise ValueError()
+    except (razorpay.errors.SignatureVerificationError, ValueError, AttributeError):
+        return HttpResponse(status=400)
+    if event not in ('payment.captured', 'order.paid', 'payment.authorized', 'payment.failed', 'refund.processed'):
         return HttpResponse(status=200)
-    return HttpResponse(status=405)
+    import hashlib
+    inbox, _ = ProviderEvent.objects.get_or_create(fingerprint=hashlib.sha256(request.body).hexdigest(), defaults={
+        'event': event, 'payment_id': str(payment.get('id') or refund.get('payment_id') or '')[:100],
+        'provider_order_id': str(payment.get('order_id') or '')[:100],
+    })
+    # Do not shortcut on inbox state: revalidate durable financial state on every delivery.
+    try:
+        if event == 'refund.processed':
+            record_processed_refund(refund, fetch_refund_payment(client, refund))
+            response = HttpResponse(status=200)
+        else:
+            response = _process_gift_event(client, payload)
+            if response is None:
+                response = _process_merchandise_event(client, payload)
+    except ModelValidationError:
+        response = HttpResponse(status=400)
+    except Exception:
+        logger.exception('Provider event %s requires reconciliation', inbox.pk)
+        response = HttpResponse(status=503)
+    inbox.state = 'processed' if response.status_code == 200 else 'reconciliation'
+    inbox.save(update_fields=['state', 'updated_at'])
+    return response
+
+
+def _process_gift_event(client, payload):
+    event = payload['event']
+    entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
+    provider_id = entity.get('order_id')
+    if not isinstance(provider_id, str) or not provider_id:
+        return HttpResponse(status=400)
+    intent = PurchaseIntent.objects.filter(provider_order_id=provider_id).first()
+    if not intent or intent.purpose != 'gift_card':
+        return None
+    if event in ('payment.captured', 'order.paid'):
+        if event == 'order.paid' and payload.get('payload', {}).get('order', {}).get('entity', {}).get('id') != intent.provider_order_id:
+            return HttpResponse(status=400)
+        try:
+            card, _ = settle_gift_capture(intent.pk, entity)
+            return HttpResponse(status=200 if card else 503)
+        except ModelValidationError:
+            return HttpResponse(status=409)
+    # Failed/authorized are attempt observations in ProviderEvent, not purchase transitions.
+    return HttpResponse(status=200)
+
+
+def _process_merchandise_event(client, payload):
+    event = payload.get('event')
+    payment_entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
+    order_entity = payload.get('payload', {}).get('order', {}).get('entity', {})
+    gateway_order_id = payment_entity.get('order_id')
+    if not isinstance(gateway_order_id, str) or not gateway_order_id:
+        return HttpResponse(status=400)
+    if event == 'order.paid' and order_entity.get('id') != gateway_order_id:
+        return HttpResponse(status=400)
+    order_lookup = {'gateway_order_id': gateway_order_id}
+
+    late_capture = None
+    with transaction.atomic():
+        order = Order.objects.select_for_update().filter(**order_lookup).first()
+        if not order:
+            return HttpResponse(status=503)
+        if order:
+            User.objects.select_for_update().get(pk=order.user_id)
+            intent = PurchaseIntent.objects.select_for_update().filter(order=order, purpose='merchandise').first()
+            if not intent:
+                return HttpResponse(status=409)
+            try:
+                validate_wallet(intent, order)
+            except ModelValidationError:
+                return HttpResponse(status=409)
+            if event in ('payment.captured', 'order.paid'):
+                try:
+                    payment, finalized = record_gateway_capture(order, payment_entity)
+                except ModelValidationError as exc:
+                    logger.warning("Rejected Razorpay capture for order %s: %s", order.pk, exc)
+                    return HttpResponse(status=400)
+                if finalized:
+                    if order.status == 'cancelled':
+                        late_capture = (payment.pk, payment.transaction_id, payment.amount, order.pk)
+                    else:
+                        transaction.on_commit(lambda: async_notify_vendors(order))
+
+            # payment.authorized/payment.failed are recorded in ProviderEvent only.
+            # A delayed capture for this provider order remains eligible.
+
+    if late_capture:
+        payment_pk, transaction_id, amount, order_pk = late_capture
+        try:
+            client.payment.refund(transaction_id, {
+                'amount': int(amount * 100),
+                'notes': {'order_id': str(order_pk), 'reason': 'Capture after order cancellation'},
+            }, timeout=5)
+        except Exception:
+            logger.exception("Late capture refund failed for order %s", order_pk)
+            Payment.objects.filter(pk=payment_pk, status='refund_pending').update(status='refund_failed')
+
+    return HttpResponse(status=200)
 
 
 class GiftCardPurchaseView(APIView):
     permission_classes = [IsAuthenticated]
 
+    def get(self, request):
+        # Recover an interrupted response, only for the original authenticated buyer.
+        intents = PurchaseIntent.objects.filter(purchaser=request.user, purpose='gift_card').select_related('gift_card').order_by('-created_at')[:100]
+        return Response([{'intent_id': i.pk, 'state': i.state, 'idempotency_key': i.idempotency_key,
+                         **(gift_response(i.gift_card) if i.state == 'settled' and i.gift_card_id else {})} for i in intents])
+
     def post(self, request):
-        amount = request.data.get('amount')
-        if not amount:
-            return Response({'error': 'Amount is required'}, status=status.HTTP_400_BAD_REQUEST)
-
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
         try:
-            amount = Decimal(str(amount))
-        except:
-            return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+            amount = Decimal(str(request.data.get('amount')))
+            if not amount.is_finite() or not 0 < amount <= Decimal('99999999.99') or amount * 100 != int(amount * 100):
+                raise ValueError()
+            key = get_idempotency_key(request)
+            if key and len(key) > 128:
+                raise ValueError()
+        except Exception:
+            return Response({'error': 'A positive amount with at most two decimal places is required.'}, status=400)
+        terms = gift_terms(int(amount * 100))
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=request.user.pk)
+            previous = PurchaseIntent.objects.filter(purchaser=user, purpose='gift_card', idempotency_key=key).first() if key else None
+            if previous:
+                conflict = request_conflict(previous, terms)
+                if conflict:
+                    return Response(conflict, status=409)
+                try:
+                    return Response(checkout_response(previous))
+                except ModelValidationError:
+                    return Response({'error': 'Purchase already finalized or requires reconciliation.', 'intent_id': previous.pk}, status=409)
+            intent = PurchaseIntent.objects.create(purpose='gift_card', purchaser=user,
+                expected_amount=int(amount * 100), idempotency_key=key or None,
+                request_fingerprint=request_fingerprint(terms))
+        try:
+            create_provider_order(intent, razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)))
+            return Response(checkout_response(intent))
+        except Exception:
+            return Response({'error': 'Payment initialization requires reconciliation. Do not retry with a new key.',
+                             'intent_id': intent.pk}, status=503)
 
-        # Create Razorpay order
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-        order_data = {
-            'amount': int(amount * 100),
-            'currency': 'INR',
-            'receipt': f'gc_receipt_{request.user.id}'
-        }
-        rzp_order = client.order.create(data=order_data)
-
-        return Response({
-            'order_id': rzp_order['id'],
-            'amount': amount,
-            'key': settings.RAZORPAY_KEY_ID
-        }, status=status.HTTP_200_OK)
 
 class GiftCardVerifyPurchaseView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_signature = request.data.get('razorpay_signature')
-        amount = request.data.get('amount')
-
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
+        provider_id = request.data.get('razorpay_order_id')
+        payment_id = request.data.get('razorpay_payment_id')
+        signature = request.data.get('razorpay_signature')
+        if any(not isinstance(value, str) or not 1 <= len(value) <= limit
+               for value, limit in ((provider_id, 100), (payment_id, 100), (signature, 256))):
+            return Response({'error': 'Invalid payment proof.'}, status=400)
+        # Authorize intent before claims, replay, serialization or provider I/O.
+        intent = PurchaseIntent.objects.filter(purchaser=request.user, purpose='gift_card', provider_order_id=provider_id).first()
+        if not intent or intent.state not in ('pending', 'settled'):
+            return Response({'error': 'Payment does not match this purchase.'}, status=400)
         try:
-            client.utility.verify_payment_signature({
-                'razorpay_order_id': razorpay_order_id,
-                'razorpay_payment_id': razorpay_payment_id,
-                'razorpay_signature': razorpay_signature
-            })
-
-            # Signature verified. Create Gift Card inside an atomic block for safety
-            with transaction.atomic():
-                gc = GiftCard.objects.create(
-                    owner=None,
-                    initial_balance=amount,
-                    current_balance=amount
-                )
-
-                GiftCardTransaction.objects.create(
-                    gift_card=gc,
-                    transaction_type='ISSUE',
-                    amount=amount,
-                    user=request.user
-                )
-
-                # Generate QR Code
-                qr = qrcode.QRCode(version=1, box_size=10, border=5)
-                qr.add_data(str(gc.id))
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-
-                img_io = io.BytesIO()
-                img.save(img_io, format='PNG')
-                img_io.seek(0)
-
-                upload_res = cloudinary.uploader.upload(img_io, folder="gift_cards")
-                gc.qr_code_url = upload_res.get('secure_url')
-                gc.save()
-
-            return Response({
-                'message': 'Gift card purchased successfully',
-                'gift_card_id': gc.id,
-                'qr_url': gc.qr_code_url
-            }, status=status.HTTP_201_CREATED)
-
-        except razorpay.errors.SignatureVerificationError:
-            return Response({'error': 'Invalid payment signature'}, status=status.HTTP_400_BAD_REQUEST)
+            if request.data.get('amount') is not None and Decimal(str(request.data['amount'])) * 100 != intent.expected_amount:
+                raise ModelValidationError('Amount does not match purchase.')
+            claim = ProviderPaymentClaim.objects.filter(payment_id=payment_id).first()
+            if claim and (claim.intent_id != intent.pk or claim.state != 'captured'):
+                raise ModelValidationError('Payment is unavailable for this purchase.')
+            if intent.state == 'settled':
+                if not claim or not intent.gift_card_id:
+                    raise ModelValidationError('Payment does not match settled purchase.')
+                return Response(gift_response(intent.gift_card), status=201)
+            client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+            client.utility.verify_payment_signature({'razorpay_order_id': intent.provider_order_id,
+                'razorpay_payment_id': payment_id, 'razorpay_signature': signature})
+            entity = client.payment.fetch(payment_id, timeout=5)
+            if entity.get('id') != payment_id:
+                raise ModelValidationError('Provider payment does not match proof.')
+            card, _ = settle_gift_capture(intent.pk, entity)
+            return Response(gift_response(card), status=201)
+        except (ModelValidationError, razorpay.errors.SignatureVerificationError, ArithmeticError, ValueError):
+            return Response({'error': 'Payment does not match this purchase.'}, status=400)
+        except Exception:
+            return Response({'error': 'Payment outcome is unknown. Retry this same purchase.'}, status=503)
 
 class GiftCardCheckView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1243,7 +1743,7 @@ class GiftCardCheckView(APIView):
             if gc.owner is not None and gc.owner != request.user:
                 return Response({"error": "Unauthorized or invalid gift card."}, status=status.HTTP_403_FORBIDDEN)
             return Response({'balance': gc.current_balance}, status=status.HTTP_200_OK)
-        except GiftCard.DoesNotExist:
+        except (GiftCard.DoesNotExist, ModelValidationError, ValueError):
             return Response({'error': 'Invalid or inactive gift card'}, status=status.HTTP_400_BAD_REQUEST)
 
 class GiftCardListView(APIView):
@@ -1255,33 +1755,48 @@ class GiftCardListView(APIView):
 class GiftCardRedeemView(APIView):
     permission_classes = [IsAuthenticated]
     def post(self, request):
+        if not isinstance(request.data, dict):
+            return Response({'error': 'Invalid purchase request.'}, status=400)
         gift_card_id = request.data.get('gift_card_id')
         try:
             with transaction.atomic():
+                intent = PurchaseIntent.objects.select_for_update().filter(gift_card_id=gift_card_id,
+                    purpose='gift_card', state='settled', claim__state='captured').first()
+                if not intent:
+                    return Response({'error': 'Gift card requires purchase reconciliation.'}, status=400)
                 gc = GiftCard.objects.select_for_update().get(Q(owner=None) | Q(owner=request.user), id=gift_card_id, is_active=True)
+                if gc.expires_at and gc.expires_at <= timezone.now():
+                    return Response({'error': 'Gift card has expired.'}, status=400)
+                if gc.current_balance * 100 != intent.expected_amount:
+                    return Response({'error': 'Gift card balance requires reconciliation.'}, status=400)
                 user = User.objects.select_for_update().get(id=request.user.id)
                 if gc.current_balance > 0:
                     amount_to_add = gc.current_balance
-                    user.wallet_balance += amount_to_add
-                    user.save()
-                    
+                    record_wallet_transaction(
+                        user=user,
+                        amount=amount_to_add,
+                        transaction_type='CREDIT_GIFT_CARD',
+                        reference_id=str(gc.id),
+                        description=f"Redeemed Gift Card {gc.id}"
+                    )
+
                     gc.owner = user
                     gc.current_balance = Decimal('0.00')
                     gc.is_active = False
                     gc.save()
-                    
+
                     GiftCardTransaction.objects.create(
                         gift_card=gc,
                         transaction_type='REDEEM',
                         amount=amount_to_add,
                         user=user
                     )
-                    
+
                     return Response({
                         'message': f'Successfully added {amount_to_add} to wallet balance.',
                         'new_balance': str(user.wallet_balance)
                     }, status=status.HTTP_200_OK)
                 else:
                     return Response({'error': 'Gift card has zero balance.'}, status=status.HTTP_400_BAD_REQUEST)
-        except GiftCard.DoesNotExist:
+        except (GiftCard.DoesNotExist, ModelValidationError, ValueError):
             return Response({'error': 'Invalid or inactive gift card.'}, status=status.HTTP_400_BAD_REQUEST)

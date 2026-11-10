@@ -13,7 +13,7 @@ class IsAdminOrOwner(permissions.BasePermission):
         if request.user.is_staff:
             return True
         return obj.user == request.user
-    
+
 class IsOwnerOrAdmin(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.user.is_staff or getattr(request.user, 'role', '') == 'admin':
@@ -35,3 +35,38 @@ class IsSellerAdminOrReadOnly(BasePermission):
         if request.method in SAFE_METHODS:
             return True
         return bool(request.user and request.user.is_authenticated and getattr(request.user, 'role', '') in ['admin', 'seller'])
+
+
+# ==========================================
+# SEC-02: Object-level permission for product mutations.
+# Admins can edit any product; sellers can only mutate their own listings.
+# ==========================================
+class IsProductOwnerOrAdmin(BasePermission):
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return bool(
+            request.user and request.user.is_authenticated
+            and getattr(request.user, 'role', '') in ['admin', 'seller']
+        )
+
+    def has_object_permission(self, request, view, obj):
+        # Read access is public for approved products (catalog browsing)
+        if request.method in SAFE_METHODS:
+            return True
+        # Administrators have full authority
+        if getattr(request.user, 'role', '') == 'admin' or request.user.is_staff or request.user.is_superuser:
+            return True
+        # Sellers may only modify their own products
+        return getattr(request.user, 'role', '') == 'seller' and obj.vendor == request.user
+
+
+class IsAdminUserOrReadOnly(BasePermission):
+    """Allows safe methods (GET, HEAD, OPTIONS) for any user, but restricts write operations to admins."""
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return bool(
+            request.user and request.user.is_authenticated and
+            (getattr(request.user, 'role', '') == 'admin' or request.user.is_staff or request.user.is_superuser)
+        )

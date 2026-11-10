@@ -4,10 +4,14 @@ logger = logging.getLogger(__name__)
 
 import os
 import hashlib
+import ipaddress
+import socket
+from urllib.parse import urlparse
 import requests
 import concurrent.futures
 from io import BytesIO
 from django.conf import settings
+from django.utils.html import escape
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
@@ -28,6 +32,52 @@ session.mount('http://', adapter)
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 })
+
+def is_safe_image_url(url):
+    """
+    Enterprise SSRF defense:
+    Validates that a URL uses http/https, has a valid hostname,
+    and resolves strictly to public, non-private IP addresses.
+    Blocks cloud metadata endpoints (169.254.169.254), loopback (127.0.0.1),
+    and internal RFC 1918 subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme.lower() not in ('http', 'https'):
+            return False
+
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        hostname_lower = hostname.lower()
+        if hostname_lower in ('localhost', '0.0.0.0', '127.0.0.1', '::1', 'metadata.google.internal'):
+            return False
+
+        # Resolve all IPs for the hostname
+        addr_info = socket.getaddrinfo(hostname, None)
+        if not addr_info:
+            return False
+
+        for item in addr_info:
+            ip_str = item[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_loopback or
+                ip.is_private or
+                ip.is_link_local or
+                ip.is_multicast or
+                ip.is_reserved or
+                ip.is_unspecified
+            ):
+                return False
+
+        return True
+    except Exception as e:
+        logger.warning(f"[SSRF BLOCKED] Invalid or unresolvable image URL '{url}': {e}")
+        return False
 
 def format_pdf_inr(amount):
     """Safe INR formatter for ReportLab standard fonts to prevent black square glyph errors."""
@@ -72,14 +122,55 @@ def get_product_image(item):
             if img_source.startswith('/media/') or not img_source.startswith('http'):
                 clean_path = img_source.replace('/media/', '').lstrip('/')
                 full_path = os.path.join(settings.MEDIA_ROOT, clean_path)
-                if os.path.exists(full_path):
-                    return RLImage(full_path, width=32, height=32)
+                real_path = os.path.abspath(full_path)
+                media_root_abs = os.path.abspath(str(settings.MEDIA_ROOT))
+                if not (real_path == media_root_abs or real_path.startswith(media_root_abs + os.sep)):
+                    logger.warning(f"[PDF IMAGE ERROR] Path traversal blocked: {img_source}")
+                    return None
+                if os.path.exists(real_path) and os.path.isfile(real_path):
+                    return RLImage(real_path, width=32, height=32)
             else:
-                # Download via session pool and save to local disk cache
-                response = session.get(img_source, timeout=2)
+                if not is_safe_image_url(img_source):
+                    logger.warning(f"[PDF IMAGE ERROR] SSRF blocked image URL: {img_source}")
+                    return None
+
+                MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB max
+                # Download via session pool with stream=True and validate Content-Type and payload size
+                response = session.get(img_source, timeout=2, allow_redirects=False, stream=True)
+                if response.status_code in (301, 302, 307, 308):
+                    redirect_url = response.headers.get('Location')
+                    if redirect_url and is_safe_image_url(redirect_url):
+                        response = session.get(redirect_url, timeout=2, allow_redirects=False, stream=True)
+                    else:
+                        logger.warning(f"[PDF IMAGE ERROR] Unsafe or missing redirect URL: {redirect_url}")
+                        return None
+
                 if response.status_code == 200:
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if not content_type.startswith('image/'):
+                        logger.warning(f"[PDF IMAGE ERROR] Non-image Content-Type '{content_type}' for URL: {img_source}")
+                        return None
+
+                    content_length = response.headers.get('Content-Length')
+                    if content_length:
+                        try:
+                            if int(content_length) > MAX_IMAGE_SIZE:
+                                logger.warning(f"[PDF IMAGE ERROR] Image Content-Length exceeds max size: {img_source}")
+                                return None
+                        except (ValueError, TypeError):
+                            pass
+
+                    downloaded = 0
+                    chunks = []
+                    for chunk in response.iter_content(chunk_size=65536):
+                        downloaded += len(chunk)
+                        if downloaded > MAX_IMAGE_SIZE:
+                            logger.warning(f"[PDF IMAGE ERROR] Image exceeds maximum allowed size ({MAX_IMAGE_SIZE} bytes): {img_source}")
+                            return None
+                        chunks.append(chunk)
+
                     with open(cached_file_path, 'wb') as f:
-                        f.write(response.content)
+                        f.write(b"".join(chunks))
                     return RLImage(cached_file_path, width=32, height=32)
     except Exception as e:
         logger.error(f"[PDF IMAGE ERROR] {e}")
@@ -183,19 +274,58 @@ def generate_invoice_pdf(order):
     elements.append(Spacer(1, 15))
 
     # 2. METADATA BLOCK & TRANSACTION DETAILS 🚀
-    customer_name = getattr(order.user, 'username', 'Valued Customer')
-    customer_email = getattr(order.user, 'email', 'N/A')
+    customer_name = escape(str(getattr(order.user, 'username', 'Valued Customer')))
+    customer_email = escape(str(getattr(order.user, 'email', 'N/A')))
 
     # Safely fetch the transaction details
-    payment = Payment.objects.filter(order=order).first()
-    payment_method = payment.payment_method.capitalize() if payment and payment.payment_method else "Razorpay Gateway"
-    transaction_id = payment.transaction_id if payment and payment.transaction_id else "N/A"
+    payments = Payment.objects.filter(order=order)
+    payment = payments.first()
+    has_completed_payment = payments.filter(status='completed').exists()
+    has_refunded_payment = payments.filter(status='refunded').exists()
 
-    # 🚀 DYNAMIC PAYMENT STATUS LOGIC
-    if order.status.lower() == 'cancelled':
-        payment_status_html = "<font color='#E11D48'><b>Cancelled & Refunded</b></font>"
+    payment_method = escape(payment.payment_method.capitalize()) if payment and payment.payment_method else "Razorpay Gateway"
+    transaction_id = escape(str(payment.transaction_id)) if payment and payment.transaction_id else "N/A"
+
+    # 🚀 ACCURATE STATUS-AWARE PAYMENT STATUS & COLOR LOGIC
+    status_lower = (order.status or '').lower()
+
+    if status_lower == 'cancelled':
+        has_wallet_refund = False
+        try:
+            from api.models import WalletTransaction
+            has_wallet_refund = WalletTransaction.objects.filter(
+                user=order.user,
+                transaction_type='REFUND_ORDER',
+                reference_id=f"ORDER-{order.id}"
+            ).exists()
+        except Exception:
+            pass
+
+        if has_refunded_payment or has_wallet_refund:
+            payment_status_html = "<font color='#E11D48'><b>Cancelled &amp; Refunded</b></font>"
+        else:
+            payment_status_html = "<font color='#E11D48'><b>Cancelled (Unpaid)</b></font>"
+        meta_bg_color = colors.HexColor("#FFF1F2")  # Light red / rose
+    elif status_lower in ['pending', 'pending_payment']:
+        if has_completed_payment:
+            payment_status_html = "<font color='#0B8457'><b>Paid &amp; Verified</b></font>"
+            meta_bg_color = LIGHT_GREEN_BG
+        else:
+            payment_status_html = "<font color='#D97706'><b>Payment Pending (Unpaid)</b></font>"
+            meta_bg_color = colors.HexColor("#FFFBEB")  # Light amber / warning
+    elif status_lower in ['paid', 'processing', 'shipped', 'delivered', 'completed']:
+        payment_status_html = "<font color='#0B8457'><b>Paid &amp; Verified</b></font>"
+        meta_bg_color = LIGHT_GREEN_BG
+    elif status_lower == 'failed':
+        payment_status_html = "<font color='#E11D48'><b>Payment Failed</b></font>"
+        meta_bg_color = colors.HexColor("#FFF1F2")
     else:
-        payment_status_html = "<font color='#0B8457'><b>Paid & Verified</b></font>"
+        if has_completed_payment:
+            payment_status_html = "<font color='#0B8457'><b>Paid &amp; Verified</b></font>"
+            meta_bg_color = LIGHT_GREEN_BG
+        else:
+            payment_status_html = f"<font color='#64748B'><b>{escape(order.status.capitalize())}</b></font>"
+            meta_bg_color = colors.HexColor("#F8FAFC")
 
     billing_content = f"""
             <b>Billed To:</b><br/>
@@ -205,9 +335,10 @@ def generate_invoice_pdf(order):
             <font color='#0F172A'>{payment_method}</font>
         """
 
+    safe_order_status = escape(order.status.capitalize()) if order.status else "Pending"
     status_content = f"""
             Payment: {payment_status_html}<br/>
-            Fulfillment: <b>{order.status.capitalize()}</b><br/><br/>
+            Fulfillment: <b>{safe_order_status}</b><br/><br/>
             <b>Transaction ID:</b><br/>
             <font color='#64748B' size=9>{transaction_id}</font>
         """
@@ -215,7 +346,7 @@ def generate_invoice_pdf(order):
     meta_table = Table([[Paragraph(billing_content, body_style), Paragraph(status_content, body_style)]], colWidths=[3.47 * inch, 3.47 * inch])
     meta_table.setStyle(TableStyle([
         ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ('BACKGROUND', (0,0), (-1,-1), LIGHT_GREEN_BG),
+        ('BACKGROUND', (0,0), (-1,-1), meta_bg_color),
         ('PADDING', (0,0), (-1,-1), 12),
         ('ROUNDEDCORNERS', [8, 8, 8, 8]),
     ]))
@@ -247,6 +378,7 @@ def generate_invoice_pdf(order):
 
     for item in order_items:
         product_name = getattr(item, 'name', None) or getattr(item.product, 'name', 'Product')
+        safe_product_name = escape(str(product_name))
         qty = int(item.quantity)
         price_val = float(item.price)
         total_val = qty * price_val
@@ -257,7 +389,7 @@ def generate_invoice_pdf(order):
 
         table_rows.append([
             img_cell,
-            Paragraph(product_name, body_style),
+            Paragraph(safe_product_name, body_style),
             Paragraph(str(qty), body_style),
             Paragraph(format_pdf_inr(price_val), body_style),
             Paragraph(format_pdf_inr(total_val), bold_body)
@@ -294,7 +426,7 @@ def generate_invoice_pdf(order):
         is_grand = "Grand" in label
         lbl_style = ParagraphStyle('TotalLbl', parent=body_style, fontName='Helvetica-Bold' if is_grand else 'Helvetica', textColor=PRIMARY_GREEN if is_grand else DARK_TEXT)
         val_style = ParagraphStyle('TotalVal', parent=right_body_style, fontName='Helvetica-Bold' if is_grand else 'Helvetica', textColor=PRIMARY_GREEN if is_grand else DARK_TEXT)
-        totals_table_rows.append([Paragraph(label, lbl_style), Paragraph(val, val_style)])
+        totals_table_rows.append([Paragraph(escape(label), lbl_style), Paragraph(val, val_style)])
 
     totals_table = Table(totals_table_rows, colWidths=[2.0 * inch, 1.4 * inch])
     totals_table.setStyle(TableStyle([

@@ -11,14 +11,20 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
-import dj_database_url
-from decouple import config
+from .database import database_config
+from .environment import load_environment
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+IS_TESTING = 'test' in sys.argv
+# Explicit production opt-in is required even when process DATABASE_URL is remote.
+config, LOCAL_DATABASE = load_environment(BASE_DIR, testing=IS_TESTING)
 
 
 # Quick-start development settings - unsuitable for production
@@ -30,46 +36,78 @@ SECRET_KEY = config("SECRET_KEY")
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = [
-    '.vercel.app',
-    '.onrender.com',
-    'localhost',
-    '127.0.0.1',
-    'thread-sedative-tinker.ngrok-free.dev',
-    'eazyshop.cfd',
-    '.eazyshop.cfd',
-]
+# SEC-13 / Blocker 6: Exact ALLOWED_HOSTS configuration without dangerous platform wildcards (.vercel.app, .onrender.com)
+env_allowed_hosts = config('ALLOWED_HOSTS', default='')
+if env_allowed_hosts:
+    ALLOWED_HOSTS = [h.strip() for h in env_allowed_hosts.split(',') if h.strip()]
+else:
+    ALLOWED_HOSTS = [
+        'localhost',
+        '127.0.0.1',
+        'testserver',
+        'eazyshop.cfd',
+        'www.eazyshop.cfd',
+        'api.eazyshop.cfd',
+    ]
+
+render_host = config('RENDER_EXTERNAL_HOSTNAME', default='').strip()
+if render_host and render_host not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(render_host)
 
 CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_ALL_ORIGINS = False
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
+# SEC-10 / Blocker 7: Elimination of plaintext HTTP CORS/CSRF trusted origins in production
+default_cors_origins = [
     "https://django-react-ecommerce-platform.vercel.app",
     "https://eazyshop-store.vercel.app",
     "https://eazyshop.cfd",
     "https://www.eazyshop.cfd",
-    "http://eazyshop.cfd",
-    "http://www.eazyshop.cfd",
+    "https://api.eazyshop.cfd",
 ]
+if DEBUG:
+    default_cors_origins.append("http://localhost:3000")
+    default_cors_origins.append("http://127.0.0.1:3000")
 
-CSRF_TRUSTED_ORIGINS = [
-    "https://django-react-ecommerce-platform.vercel.app",
-    "https://eazyshop-store.vercel.app",
-    "https://eazyshop.cfd",
-    "https://www.eazyshop.cfd",
-    "http://eazyshop.cfd",
-    "http://www.eazyshop.cfd",
-]
+env_cors = config('CORS_ALLOWED_ORIGINS', default='')
+if env_cors:
+    CORS_ALLOWED_ORIGINS = [o.strip() for o in env_cors.split(',') if o.strip()]
+else:
+    CORS_ALLOWED_ORIGINS = default_cors_origins
+
+# In production, strictly enforce HTTPS schemes across all allowed origins
+if not DEBUG and not IS_TESTING:
+    CORS_ALLOWED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('https://')]
+
+env_csrf = config('CSRF_TRUSTED_ORIGINS', default='')
+if env_csrf:
+    CSRF_TRUSTED_ORIGINS = [o.strip() for o in env_csrf.split(',') if o.strip()]
+else:
+    CSRF_TRUSTED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('https://')]
+    if DEBUG:
+        CSRF_TRUSTED_ORIGINS.extend(["http://localhost:3000", "http://127.0.0.1:3000"])
 
 FRONTEND_URL = config('FRONTEND_URL', default='https://eazyshop.cfd')
 
-# 🚀 Cross-Domain Cookie Security Flags (MANDATORY FOR VERCEL + RENDER)
-SESSION_COOKIE_SAMESITE = 'None'
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SAMESITE = 'None'
-CSRF_COOKIE_SECURE = True
+# One deployment-wide cookie policy, never inferred from an untrusted request.
+# Use None only for explicitly supported HTTPS cross-site deployments.
+
+AUTH_COOKIE_SAMESITE = config('AUTH_COOKIE_SAMESITE', default='Lax')
+AUTH_COOKIE_SECURE = not DEBUG
+if AUTH_COOKIE_SAMESITE not in ('Lax', 'Strict', 'None'):
+    raise ImproperlyConfigured('AUTH_COOKIE_SAMESITE must be Lax, Strict or None.')
+if AUTH_COOKIE_SAMESITE == 'None':
+    AUTH_COOKIE_SECURE = True
+SESSION_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
+SESSION_COOKIE_SECURE = AUTH_COOKIE_SECURE
+CSRF_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
+CSRF_COOKIE_SECURE = AUTH_COOKIE_SECURE
+CSRF_COOKIE_HTTPONLY = True
+CSRF_COOKIE_DOMAIN = None
+CSRF_COOKIE_PATH = '/'
+if not DEBUG and any(not origin.startswith('https://') or '*' in origin for origin in CSRF_TRUSTED_ORIGINS):
+    raise ImproperlyConfigured('Production CSRF origins must be exact HTTPS origins.')
 
 # Application definition
 
@@ -82,6 +120,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'api',
     'corsheaders',
     'rest_framework.authtoken',
@@ -133,11 +172,35 @@ WSGI_APPLICATION = 'ecommerce_platform.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 DATABASES = {
-    'default': dj_database_url.config(
-        default=f"sqlite:///{os.path.join(BASE_DIR, 'db.sqlite3')}",
-        conn_max_age=600
-    )
+    'default': database_config(
+        config('TEST_DATABASE_URL' if IS_TESTING else 'DATABASE_URL', default=''),
+        local=LOCAL_DATABASE, testing=IS_TESTING,
+    ),
 }
+if IS_TESTING:
+    TEST_RUNNER = 'ecommerce_platform.test_runner.IsolatedPostgresRunner'
+
+# 🚀 Distributed Cache Configuration (ARCH-01)
+REDIS_URL = config('REDIS_URL', default='')
+if REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': REDIS_URL,
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            }
+        }
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'eazyshop-locmem-cache',
+        }
+    }
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+SESSION_CACHE_ALIAS = 'default'
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -149,7 +212,18 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticatedOrReadOnly',
-    ]
+    ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '10000/day' if IS_TESTING else '100/minute',
+        'user': '10000/day' if IS_TESTING else '1000/minute',
+        'auth': '10000/day' if IS_TESTING else '10/minute',
+        'checkout': '10000/day' if IS_TESTING else '30/minute',
+    },
+    'NUM_PROXIES': 1,
 }
 
 
@@ -207,9 +281,9 @@ SIMPLE_JWT = {
     # 🚀 Long refresh lifetime so users don't have to log in every day
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 
-    # Keep rotation/blacklisting turned off since you aren't using the blacklist app
-    'ROTATE_REFRESH_TOKENS': False,
-    'BLACKLIST_AFTER_ROTATION': False,
+    # SEC-12 / Blocker 9: Server-side token rotation & blacklisting
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
 
     'AUTH_HEADER_TYPES': ('Bearer',),
     'USER_ID_FIELD': 'id',
@@ -223,11 +297,31 @@ STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 USE_X_FORWARDED_HOST = True
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
+# SEC-11 / Blocker 8: HTTP Strict Transport Security (HSTS) and Production SSL Headers
+if not DEBUG and not IS_TESTING:
+    SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)  # 1 Year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
+    SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+    SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+else:
+    SECURE_HSTS_SECONDS = 0
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+    SECURE_HSTS_PRELOAD = False
+    SECURE_SSL_REDIRECT = False
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+    SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+
 ANYMAIL = {
     "SENDINBLUE_API_KEY": config('BREVO_API_KEY'),
+    "REQUESTS_TIMEOUT": 5,  # Prevent worker thread hangs on Brevo API latency
 }
 
 EMAIL_BACKEND = "anymail.backends.sendinblue.EmailBackend"
+EMAIL_TIMEOUT = 5  # Standard Django socket timeout in seconds
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL')
 
 os.environ['CLOUDINARY_URL'] = config('CLOUDINARY_URL')
@@ -245,3 +339,11 @@ STORAGES = {
 RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID')
 RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET')
 RAZORPAY_WEBHOOK_SECRET = config('RAZORPAY_WEBHOOK_SECRET')
+
+# Automated tests never use configured external email, cache or media services.
+if IS_TESTING:
+    EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+    CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+    STORAGES['default'] = {'BACKEND': 'django.core.files.storage.InMemoryStorage'}
+    RAZORPAY_KEY_ID = RAZORPAY_KEY_SECRET = RAZORPAY_WEBHOOK_SECRET = 'isolated-test-placeholder'
+    ANYMAIL = {**ANYMAIL, 'SENDINBLUE_API_KEY': 'isolated-test-placeholder'}
