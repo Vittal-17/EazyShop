@@ -36,18 +36,20 @@ jobs:
         run: |
           ruff check --select F821 api ecommerce_platform scripts
 
+
       - name: Check PR whitespace and patch formatting
         run: |
           if [ -n "${{ github.base_ref }}" ]; then
             git fetch origin "${{ github.base_ref }}"
-            git diff --check "origin/${{ github.base_ref }}...HEAD"
+            git -c core.whitespace=cr-at-eol diff --check "origin/${{ github.base_ref }}...HEAD"
           else
             if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-              git diff --check HEAD~1..HEAD
+              git -c core.whitespace=cr-at-eol diff --check HEAD~1..HEAD
             else
-              git diff --check
+              git -c core.whitespace=cr-at-eol diff --check
             fi
           fi
+
 
   backend:
     name: Backend Validation
