@@ -9,8 +9,15 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .models import (CartItem, GiftCard, GiftCardTransaction, Order, Payment,
-                     ProviderPaymentClaim, PurchaseIntent)
+from .models import (
+    CartItem,
+    GiftCard,
+    GiftCardTransaction,
+    Order,
+    Payment,
+    ProviderPaymentClaim,
+    PurchaseIntent,
+)
 
 
 def create_provider_order(intent, client):
@@ -44,6 +51,20 @@ def create_provider_order(intent, client):
         raise
 
 
+def normalize_provider_method(entity):
+    if not isinstance(entity, dict):
+        raise ValidationError('Invalid entity structure.')
+    if 'method' not in entity:
+        return 'razorpay'
+    method = entity['method']
+    if not isinstance(method, str) or '\x00' in method:
+        raise ValidationError('Invalid payment method format.')
+    cleaned = method.strip()
+    if not (1 <= len(cleaned) <= 50):
+        raise ValidationError('Invalid payment method length.')
+    return 'razorpay_wallet' if cleaned == 'wallet' else cleaned
+
+
 def validate_capture(intent, entity):
     if (
         not isinstance(entity, dict)
@@ -53,9 +74,11 @@ def validate_capture(intent, entity):
         or entity.get('amount_refunded', 0) != 0
         or type(entity.get('amount')) is not int or entity['amount'] != intent.expected_amount
         or intent.expected_amount <= 0
-        or not isinstance(entity.get('method', 'razorpay'), str)
-        or entity.get('method', 'razorpay') in ('', 'wallet')
     ):
+        raise ValidationError('Capture does not match the authorized purchase.')
+    try:
+        normalize_provider_method(entity)
+    except ValidationError:
         raise ValidationError('Capture does not match the authorized purchase.')
 
 
@@ -119,7 +142,7 @@ def record_gateway_capture(order, entity):
         payment = Payment(order=order, transaction_id=entity['id'])
     elif payment.status != 'authorized':
         raise ValidationError('Payment is not eligible for capture.')
-    payment.payment_method = entity.get('method', 'razorpay')
+    payment.payment_method = normalize_provider_method(entity)
     payment.amount = captured_amount
     payment.status = 'refund_pending' if order.status == 'cancelled' else 'completed'
     payment.verified_at = timezone.now()
