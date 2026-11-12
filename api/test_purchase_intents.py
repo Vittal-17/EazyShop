@@ -104,7 +104,9 @@ class PurchaseIntentTests(APITestCase):
                 valid = dict(self.capture)
                 for bad in ({'order_id': 'unrelated'}, {'currency': 'USD'}, {'amount': 4999}, {'amount': 5001},
                             {'amount': True}, {'amount': '5000'}, {'status': 'authorized'}, {'status': 'failed'},
-                            {'status': 'refunded'}, {'amount_refunded': 1}, {'method': 'wallet'}, {'id': 'foreign'}):
+                            {'status': 'refunded'}, {'amount_refunded': 1}, {'id': 'foreign'},
+                            {'method': ''}, {'method': '   '}, {'method': None}, {'method': 123},
+                            {'method': 'wallet\x00extra'}, {'method': 'a' * 51}):
                     with self.subTest(bad=bad):
                         before = self.financial_state()
                         self.gateway.payment.fetch.return_value = {**valid, **bad, 'notes': {'purpose': purpose, 'wallet_deducted': 50}}
